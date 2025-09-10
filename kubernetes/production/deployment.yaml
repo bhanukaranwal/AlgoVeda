@@ -1,0 +1,292 @@
+# AlgoVeda Production Kubernetes Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: algoveda-core
+  namespace: algoveda-prod
+  labels:
+    app: algoveda-core
+    version: v1.0.0
+    component: core
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: algoveda-core
+  template:
+    metadata:
+      labels:
+        app: algoveda-core
+        version: v1.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: algoveda-sa
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsNonRoot: true
+      initContainers:
+      - name: wait-for-db
+        image: postgres:15-alpine
+        command:
+        - sh
+        - -c
+        - |
+          until pg_isready -h postgres -p 5432 -U algoveda; do
+            echo "Waiting for database..."
+            sleep 2
+          done
+          echo "Database is ready!"
+      - name: run-migrations
+        image: algoveda/platform:v1.0.0
+        command:
+        - python
+        - -c
+        - |
+          from algoveda.database import migrate_database
+          migrate_database()
+        env:
+        - name: DB_HOST
+          value: "postgres"
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: algoveda-secrets
+              key: db-password
+      containers:
+      - name: algoveda-core
+        image: algoveda/platform:v1.0.0
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        - containerPort: 8443
+          name: https
+          protocol: TCP
+        - containerPort: 9090
+          name: metrics
+          protocol: TCP
+        env:
+        - name: ALGOVEDA_ENV
+          value: "production"
+        - name: DB_HOST
+          value: "postgres"
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: algoveda-secrets
+              key: db-password
+        - name: REDIS_HOST
+          value: "redis"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: algoveda-secrets
+              key: redis-password
+        - name: JWT_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: algoveda-secrets
+              key: jwt-secret
+        - name: DHAN_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: broker-secrets
+              key: dhan-client-id
+        - name: DHAN_ACCESS_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: broker-secrets
+              key: dhan-access-token
+        - name: DHAN_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: broker-secrets
+              key: dhan-api-key
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 1
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "8"
+            memory: "16Gi"
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: logs
+          mountPath: /logs
+        - name: data
+          mountPath: /data
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: config
+        configMap:
+          name: algoveda-config
+      - name: logs
+        persistentVolumeClaim:
+          claimName: algoveda-logs-pvc
+      - name: data
+        persistentVolumeClaim:
+          claimName: algoveda-data-pvc
+      - name: tmp
+        emptyDir: {}
+      nodeSelector:
+        node-type: gpu-enabled
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - algoveda-core
+              topologyKey: kubernetes.io/hostname
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: algoveda-core-service
+  namespace: algoveda-prod
+  labels:
+    app: algoveda-core
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+    protocol: TCP
+  - name: https
+    port: 443
+    targetPort: 8443
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+  selector:
+    app: algoveda-core
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: algoveda-ingress
+  namespace: algoveda-prod
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/rate-limit: "1000"
+    nginx.ingress.kubernetes.io/websocket-services: algoveda-core-service
+spec:
+  tls:
+  - hosts:
+    - algoveda.com
+    - api.algoveda.com
+    secretName: algoveda-tls
+  rules:
+  - host: algoveda.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: algoveda-core-service
+            port:
+              number: 80
+  - host: api.algoveda.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: algoveda-core-service
+            port:
+              number: 80
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: algoveda-hpa
+  namespace: algoveda-prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: algoveda-core
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      - type: Pods
+        value: 4
+        periodSeconds: 15
+      selectPolicy: Max
