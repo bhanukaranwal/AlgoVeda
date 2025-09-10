@@ -1,0 +1,410 @@
+# AlgoVeda Production Configuration
+server:
+  version: "1.0.0"
+  port: 8080
+  host: "0.0.0.0"
+  read_timeout: 30
+  write_timeout: 30
+  idle_timeout: 120
+  max_connections: 10000
+  enable_compression: true
+  enable_cors: true
+  cors_origins:
+    - "https://algoveda.com"
+    - "https://app.algoveda.com"
+
+websocket:
+  read_buffer_size: 4096
+  write_buffer_size: 4096
+  enable_compression: true
+  ping_period: "54s"
+  pong_wait: "60s"
+  read_timeout: "60s"
+  write_timeout: "10s"
+  idle_timeout: "300s"
+  max_message_size: 512
+  message_queue_size: 256
+  rate_limit:
+    max_requests: 1000
+    window: "1m"
+
+networking:
+  tcp_nodelay: true
+  tcp_keepalive: true
+  tcp_keepalive_idle: "600s"
+  tcp_keepalive_interval: "60s"
+  tcp_keepalive_count: 3
+  socket_reuse_port: true
+  connection_pool_size: 100
+  dns_cache_timeout: "300s"
+
+routing:
+  default_timeout: "30s"
+  max_retry_attempts: 3
+  retry_backoff: "exponential"
+  retry_base_delay: "100ms"
+  retry_max_delay: "30s"
+  load_balancer:
+    algorithm: "round_robin" # round_robin, least_connections, weighted
+    health_check_interval: "30s"
+    unhealthy_threshold: 3
+    healthy_threshold: 2
+
+security:
+  authentication:
+    jwt:
+      secret_key: "${JWT_SECRET_KEY}"
+      expiry_duration: "24h"
+      refresh_token_expiry: "168h" # 7 days
+    api_keys:
+      enabled: true
+      rate_limit: 10000
+  authorization:
+    rbac_enabled: true
+    default_permissions: ["read"]
+  encryption:
+    algorithm: "AES-256-GCM"
+    key_rotation_interval: "24h"
+  tls:
+    enabled: true
+    cert_file: "/etc/ssl/certs/algoveda.crt"
+    key_file: "/etc/ssl/private/algoveda.key"
+    min_version: "1.3"
+    cipher_suites:
+      - "TLS_AES_256_GCM_SHA384"
+      - "TLS_CHACHA20_POLY1305_SHA256"
+      - "TLS_AES_128_GCM_SHA256"
+
+monitoring:
+  metrics:
+    enabled: true
+    endpoint: "/metrics"
+    interval: "30s"
+  logging:
+    level: "info"
+    format: "json"
+    output: "stdout"
+    max_size: "100MB"
+    max_age: "7d"
+    max_backups: 10
+    compression: true
+  tracing:
+    enabled: true
+    sampler: "probabilistic"
+    sampling_rate: 0.01 # 1%
+    jaeger:
+      endpoint: "http://jaeger:14268/api/traces"
+  alerting:
+    enabled: true
+    webhook_url: "${ALERT_WEBHOOK_URL}"
+    critical_threshold: 0.95
+    warning_threshold: 0.80
+
+database:
+  primary:
+    host: "${DB_HOST}"
+    port: 5432
+    database: "${DB_NAME}"
+    username: "${DB_USER}"
+    password: "${DB_PASSWORD}"
+    max_connections: 100
+    min_connections: 10
+    connection_timeout: "30s"
+    idle_timeout: "300s"
+    max_lifetime: "1h"
+    ssl_mode: "require"
+  read_replicas:
+    - host: "${DB_READ_HOST_1}"
+      port: 5432
+      weight: 1
+    - host: "${DB_READ_HOST_2}"
+      port: 5432
+      weight: 1
+  redis:
+    host: "${REDIS_HOST}"
+    port: 6379
+    password: "${REDIS_PASSWORD}"
+    database: 0
+    max_connections: 200
+    min_connections: 20
+    connection_timeout: "5s"
+    read_timeout: "3s"
+    write_timeout: "3s"
+    cluster_mode: true
+    master_name: "algoveda-master"
+
+trading:
+  risk_limits:
+    max_position_value: 10000000.0 # $10M per position
+    max_daily_loss: 500000.0 # $500K daily loss limit
+    max_portfolio_var: 1000000.0 # $1M VaR limit
+    max_leverage: 4.0
+    max_concentration: 0.20 # 20% max concentration
+    max_sector_exposure: 0.30 # 30% max sector exposure
+    max_correlation: 0.70
+    max_drawdown: 0.15 # 15% max drawdown
+    min_liquidity_ratio: 0.10 # 10% minimum liquidity
+    max_options_delta: 1000000.0
+    max_options_gamma: 100000.0
+    max_options_vega: 500000.0
+  
+  execution:
+    default_slippage: 0.0005 # 0.05% default slippage
+    default_commission: 0.001 # 0.1% default commission
+    market_impact_model: "almgren_chriss"
+    execution_algorithms:
+      - "twap"
+      - "vwap"
+      - "implementation_shortfall"
+      - "participation_rate"
+    
+  market_data:
+    primary_provider: "dhan"
+    backup_providers:
+      - "yahoo"
+      - "alpha_vantage"
+    update_frequency: "1s"
+    history_retention: "2y"
+    
+backtesting:
+  engine: "vectorized" # vectorized, event_driven
+  initial_capital: 1000000.0
+  commission_model: "fixed" # fixed, percentage, tiered
+  slippage_model: "linear" # linear, square_root, custom
+  market_impact_model: "almgren_chriss"
+  benchmark: "SPY"
+  risk_free_rate: 0.02
+  
+  optimization:
+    algorithm: "genetic" # genetic, particle_swarm, grid_search
+    population_size: 100
+    generations: 50
+    mutation_rate: 0.1
+    crossover_rate: 0.8
+    parallel_workers: 8
+  
+  validation:
+    train_ratio: 0.6
+    validation_ratio: 0.2
+    test_ratio: 0.2
+    cross_validation_folds: 5
+    purge_gap: "1d"
+    embargo_period: "1d"
+
+machine_learning:
+  feature_engineering:
+    lookback_periods: [5, 10, 20, 60, 120, 252]
+    technical_indicators:
+      - "sma"
+      - "ema"
+      - "rsi"
+      - "macd"
+      - "bollinger_bands"
+      - "stochastic"
+    fundamental_features:
+      - "pe_ratio"
+      - "pb_ratio"
+      - "debt_to_equity"
+      - "roe"
+      - "roa"
+    alternative_data:
+      - "news_sentiment"
+      - "social_sentiment"
+      - "earnings_revisions"
+  
+  models:
+    default_model: "lightgbm"
+    ensemble_methods:
+      - "voting"
+      - "stacking"
+      - "blending"
+    hyperparameter_optimization:
+      method: "bayesian" # grid, random, bayesian
+      max_trials: 100
+      cv_folds: 5
+  
+  training:
+    batch_size: 1024
+    learning_rate: 0.01
+    early_stopping_patience: 10
+    validation_split: 0.2
+    regularization:
+      l1_alpha: 0.001
+      l2_alpha: 0.001
+      dropout: 0.2
+
+dhan_integration:
+  client_id: "${DHAN_CLIENT_ID}"
+  access_token: "${DHAN_ACCESS_TOKEN}"
+  api_key: "${DHAN_API_KEY}"
+  base_url: "https://api.dhan.co"
+  sandbox_url: "https://api.sandbox.dhan.co"
+  environment: "production" # sandbox, production
+  
+  rate_limits:
+    orders_per_second: 10
+    market_data_per_second: 100
+    positions_per_minute: 60
+  
+  retry_policy:
+    max_retries: 3
+    base_delay: "100ms"
+    max_delay: "30s"
+    backoff_multiplier: 2.0
+  
+  circuit_breaker:
+    failure_threshold: 5
+    recovery_timeout: "60s"
+  
+  websocket:
+    endpoint: "wss://api-feed.dhan.co"
+    heartbeat_interval: "30s"
+    reconnect_interval: "5s"
+    max_reconnect_attempts: 10
+
+gpu_computing:
+  cuda:
+    device_id: 0
+    memory_pool_size: "2GB"
+    stream_count: 4
+    block_size: 256
+    grid_size: 1024
+  
+  kernels:
+    options_pricing:
+      threads_per_block: 256
+      blocks_per_grid: 1024
+    monte_carlo:
+      paths_per_thread: 1000
+      threads_per_block: 512
+    risk_calculations:
+      scenarios_per_thread: 100
+      threads_per_block: 256
+
+performance:
+  cpu_optimization:
+    enable_simd: true
+    enable_avx2: true
+    enable_fma: true
+    thread_count: 16
+    numa_aware: true
+  
+  memory:
+    pool_size: "4GB"
+    page_size: "2MB"
+    prefetch_enabled: true
+    cache_line_size: 64
+  
+  network:
+    tcp_no_delay: true
+    tcp_quick_ack: true
+    socket_buffer_size: "64KB"
+    kernel_bypass: true # DPDK integration
+  
+  profiling:
+    enabled: true
+    sampling_frequency: 100 # Hz
+    flame_graph_enabled: true
+
+deployment:
+  container:
+    image: "algoveda/platform:latest"
+    resources:
+      cpu_request: "4"
+      cpu_limit: "16"
+      memory_request: "8Gi"
+      memory_limit: "32Gi"
+      gpu_request: "1"
+    
+  kubernetes:
+    namespace: "algoveda-prod"
+    replicas: 3
+    max_surge: 1
+    max_unavailable: 0
+    
+    service:
+      type: "LoadBalancer"
+      port: 443
+      target_port: 8080
+    
+    ingress:
+      class: "nginx"
+      tls_secret: "algoveda-tls"
+      annotations:
+        nginx.ingress.kubernetes.io/rate-limit: "1000"
+        nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    
+    health_checks:
+      liveness_probe:
+        path: "/health"
+        initial_delay: 30
+        period: 10
+        timeout: 5
+        failure_threshold: 3
+      readiness_probe:
+        path: "/ready"
+        initial_delay: 5
+        period: 5
+        timeout: 3
+        failure_threshold: 1
+
+external_services:
+  market_data:
+    bloomberg:
+      enabled: false
+      api_key: "${BLOOMBERG_API_KEY}"
+    refinitiv:
+      enabled: false
+      api_key: "${REFINITIV_API_KEY}"
+    alpha_vantage:
+      enabled: true
+      api_key: "${ALPHA_VANTAGE_API_KEY}"
+  
+  news:
+    newsapi:
+      enabled: true
+      api_key: "${NEWSAPI_KEY}"
+    bloomberg_news:
+      enabled: false
+      api_key: "${BLOOMBERG_NEWS_KEY}"
+  
+  alternative_data:
+    satellite_imagery:
+      enabled: false
+      provider: "planet"
+      api_key: "${PLANET_API_KEY}"
+    social_sentiment:
+      enabled: true
+      provider: "stocktwits"
+      api_key: "${STOCKTWITS_API_KEY}"
+
+feature_flags:
+  advanced_options_strategies: true
+  gpu_acceleration: true
+  machine_learning_models: true
+  real_time_risk_management: true
+  alternative_data_sources: false
+  high_frequency_trading: true
+  cross_asset_trading: true
+  international_markets: false
+  crypto_trading: false
+  forex_trading: false
+
+compliance:
+  regulatory_reporting:
+    enabled: true
+    jurisdiction: "US" # US, EU, IN
+    reports:
+      - "trade_reporting"
+      - "position_reporting"
+      - "risk_reporting"
+  
+  audit_trail:
+    enabled: true
+    retention_period: "7y"
+    immutable_storage: true
+    
+  market_abuse:
+    surveillance_enabled: true
+    pattern_detection: true
+    alert_threshold: 0.95
