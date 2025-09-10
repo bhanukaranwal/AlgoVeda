@@ -1,0 +1,248 @@
+# Complete Kubernetes Production Deployment for AlgoVeda
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: algoveda-prod
+  labels:
+    name: algoveda-prod
+---
+# ConfigMap for application configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: algoveda-config
+  namespace: algoveda-prod
+data:
+  trading_config.yaml: |
+    max_order_size: 1000000
+    max_position_size: 5000000
+    risk_check_interval: 100ms
+    market_data_update_frequency: 1ms
+  database_config.yaml: |
+    host: postgres-cluster-service
+    port: 5432
+    database: algoveda
+    max_connections: 100
+    connection_timeout: 5s
+---
+# Secret for sensitive configuration
+apiVersion: v1
+kind: Secret
+metadata:
+  name: algoveda-secrets
+  namespace: algoveda-prod
+type: Opaque
+stringData:
+  database_password: "secure_password_here"
+  api_keys: "dhan_api_key_here"
+  jwt_secret: "jwt_secret_key_here"
+---
+# Core Engine Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: algoveda-core-engine
+  namespace: algoveda-prod
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: algoveda-core-engine
+  template:
+    metadata:
+      labels:
+        app: algoveda-core-engine
+        version: v1
+    spec:
+      containers:
+      - name: core-engine
+        image: algoveda/core-engine:latest
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: metrics
+        env:
+        - name: RUST_LOG
+          value: "info"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: algoveda-secrets
+              key: database_url
+        - name: REDIS_URL
+          value: "redis://redis-cluster-service:6379"
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2000m"
+          limits:
+            memory: "8Gi"
+            cpu: "4000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+        - name: logs-volume
+          mountPath: /app/logs
+      - name: websocket-gateway
+        image: algoveda/websocket-gateway:latest
+        ports:
+        - containerPort: 8081
+          name: websocket
+        env:
+        - name: CORE_ENGINE_URL
+          value: "http://localhost:8080"
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+      volumes:
+      - name: config-volume
+        configMap:
+          name: algoveda-config
+      - name: logs-volume
+        emptyDir: {}
+      nodeSelector:
+        node-type: high-performance
+      tolerations:
+      - key: "high-performance"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+---
+# Service for Core Engine
+apiVersion: v1
+kind: Service
+metadata:
+  name: algoveda-core-service
+  namespace: algoveda-prod
+  labels:
+    app: algoveda-core-engine
+spec:
+  selector:
+    app: algoveda-core-engine
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  - name: websocket
+    port: 8081
+    targetPort: 8081
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+  type: ClusterIP
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: algoveda-core-hpa
+  namespace: algoveda-prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: algoveda-core-engine
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: Pods
+    pods:
+      metric:
+        name: websocket_connections_per_pod
+      target:
+        type: AverageValue
+        averageValue: "5000"
+---
+# Pod Disruption Budget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: algoveda-core-pdb
+  namespace: algoveda-prod
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: algoveda-core-engine
+---
+# Network Policy
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: algoveda-network-policy
+  namespace: algoveda-prod
+spec:
+  podSelector:
+    matchLabels:
+      app: algoveda-core-engine
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8080
+    - protocol: TCP
+      port: 8081
+  egress:
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 5432  # PostgreSQL
+    - protocol: TCP
+      port: 6379  # Redis
+    - protocol: TCP
+      port: 443   # HTTPS outbound
+---
+# ServiceMonitor for Prometheus
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: algoveda-core-metrics
+  namespace: algoveda-prod
+spec:
+  selector:
+    matchLabels:
+      app: algoveda-core-engine
+  endpoints:
+  - port: metrics
+    interval: 5s
+    path: /metrics
