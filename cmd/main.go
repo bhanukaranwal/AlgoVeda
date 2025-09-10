@@ -1,263 +1,635 @@
+/*
+ * WebSocket Gateway Main Application
+ * High-performance WebSocket server for real-time trading data
+ */
+
 package main
 
 import (
-    "context"
-    "flag"
-    "fmt"
-    "log"
-    "net/http"
-    "os"
-    "os/signal"
-    "sync"
-    "syscall"
-    "time"
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-    "github.com/algoveda/websocket-gateway/internal/config"
-    "github.com/algoveda/websocket-gateway/internal/monitoring"
-    "github.com/algoveda/websocket-gateway/internal/networking"
-    "github.com/algoveda/websocket-gateway/internal/routing"
-    "github.com/algoveda/websocket-gateway/internal/security"
-    "github.com/algoveda/websocket-gateway/internal/websocket"
-    
-    "github.com/prometheus/client_golang/prometheus/promhttp"
-    "go.uber.org/zap"
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"algoveda/internal/config"
+	"algoveda/internal/websocket"
+	"algoveda/internal/monitoring"
+	"algoveda/internal/security"
+	"algoveda/internal/loadbalancer"
+	"algoveda/pkg/logger"
 )
 
-type Server struct {
-    config          *config.Config
-    logger          *zap.Logger
-    wsManager       *websocket.ConnectionManager
-    router          *routing.MessageRouter
-    securityManager *security.Manager
-    networkManager  *networking.Manager
-    monitor         *monitoring.Monitor
-    httpServer      *http.Server
-    shutdownOnce    sync.Once
-    shutdownCh      chan struct{}
+var (
+	configFile = flag.String("config", "config/production.yaml", "Configuration file path")
+	logLevel   = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	cpuProfile = flag.String("cpuprofile", "", "Enable CPU profiling")
+	memProfile = flag.String("memprofile", "", "Enable memory profiling")
+)
+
+// Application holds the main application components
+type Application struct {
+	config          *config.Config
+	logger          *logger.Logger
+	wsManager       *websocket.Manager
+	httpServer      *http.Server
+	metricsServer   *http.Server
+	loadBalancer    *loadbalancer.LoadBalancer
+	securityManager *security.Manager
+	monitoring      *monitoring.Monitor
 }
 
 func main() {
-    var configPath = flag.String("config", "configs/production.yaml", "Path to configuration file")
-    flag.Parse()
+	flag.Parse()
 
-    // Load configuration
-    cfg, err := config.Load(*configPath)
-    if err != nil {
-        log.Fatalf("Failed to load configuration: %v", err)
-    }
+	// Initialize application
+	app, err := NewApplication()
+	if err != nil {
+		log.Fatalf("Failed to initialize application: %v", err)
+	}
 
-    // Initialize logger
-    logger, err := initLogger(cfg.Logging.Level, cfg.Logging.Format)
-    if err != nil {
-        log.Fatalf("Failed to initialize logger: %v", err)
-    }
-    defer logger.Sync()
+	// Start application
+	if err := app.Start(); err != nil {
+		log.Fatalf("Failed to start application: %v", err)
+	}
 
-    // Create server
-    server, err := NewServer(cfg, logger)
-    if err != nil {
-        logger.Fatal("Failed to create server", zap.Error(err))
-    }
-
-    // Start server
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-
-    if err := server.Start(ctx); err != nil {
-        logger.Fatal("Failed to start server", zap.Error(err))
-    }
-
-    // Wait for shutdown signal
-    sigCh := make(chan os.Signal, 1)
-    signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-    
-    select {
-    case sig := <-sigCh:
-        logger.Info("Received shutdown signal", zap.String("signal", sig.String()))
-    case <-server.shutdownCh:
-        logger.Info("Server shutdown requested")
-    }
-
-    // Graceful shutdown
-    shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer shutdownCancel()
-    
-    if err := server.Shutdown(shutdownCtx); err != nil {
-        logger.Error("Error during shutdown", zap.Error(err))
-    }
-
-    logger.Info("Server shutdown complete")
+	// Wait for shutdown signal
+	app.WaitForShutdown()
 }
 
-func NewServer(cfg *config.Config, logger *zap.Logger) (*Server, error) {
-    // Initialize monitoring
-    monitor := monitoring.NewMonitor(cfg.Monitoring, logger)
+// NewApplication creates a new application instance
+func NewApplication() (*Application, error) {
+	// Load configuration
+	cfg, err := config.Load(*configFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
+	}
 
-    // Initialize security manager
-    securityManager, err := security.NewManager(cfg.Security, logger)
-    if err != nil {
-        return nil, fmt.Errorf("failed to create security manager: %w", err)
-    }
+	// Initialize logger
+	log := logger.New(logger.Config{
+		Level:  *logLevel,
+		Format: cfg.Logging.Format,
+		Output: cfg.Logging.Output,
+	})
 
-    // Initialize network manager
-    networkManager, err := networking.NewManager(cfg.Networking, logger, monitor)
-    if err != nil {
-        return nil, fmt.Errorf("failed to create network manager: %w", err)
-    }
+	log.Info("Initializing AlgoVeda WebSocket Gateway",
+		"version", cfg.App.Version,
+		"build", cfg.App.BuildHash,
+		"config", *configFile)
 
-    // Initialize WebSocket connection manager
-    wsManager, err := websocket.NewConnectionManager(cfg.WebSocket, logger, monitor, securityManager)
-    if err != nil {
-        return nil, fmt.Errorf("failed to create WebSocket manager: %w", err)
-    }
+	// Initialize security manager
+	securityManager, err := security.NewManager(cfg.Security)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize security manager: %w", err)
+	}
 
-    // Initialize message router
-    router, err := routing.NewMessageRouter(cfg.Routing, logger, monitor)
-    if err != nil {
-        return nil, fmt.Errorf("failed to create message router: %w", err)
-    }
+	// Initialize monitoring
+	monitor := monitoring.NewMonitor(cfg.Monitoring)
 
-    // Setup HTTP server
-    mux := http.NewServeMux()
-    
-    // WebSocket endpoint
-    mux.HandleFunc("/ws", wsManager.HandleWebSocket)
-    
-    // Health check endpoint
-    mux.HandleFunc("/health", handleHealthCheck)
-    
-    // Metrics endpoint
-    mux.Handle("/metrics", promhttp.Handler())
-    
-    // Admin endpoints
-    mux.HandleFunc("/admin/connections", wsManager.HandleAdminConnections)
-    mux.HandleFunc("/admin/stats", monitor.HandleAdminStats)
+	// Initialize WebSocket manager
+	wsManager := websocket.NewManager(websocket.Config{
+		MaxConnections:     cfg.WebSocket.MaxConnections,
+		ReadBufferSize:     cfg.WebSocket.ReadBufferSize,
+		WriteBufferSize:    cfg.WebSocket.WriteBufferSize,
+		WriteTimeout:       cfg.WebSocket.WriteTimeout,
+		ReadTimeout:        cfg.WebSocket.ReadTimeout,
+		PingInterval:       cfg.WebSocket.PingInterval,
+		MaxMessageSize:     cfg.WebSocket.MaxMessageSize,
+		CompressionEnabled: cfg.WebSocket.CompressionEnabled,
+		Logger:             log,
+		Monitor:            monitor,
+		SecurityManager:    securityManager,
+	})
 
-    httpServer := &http.Server{
-        Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
-        Handler:      mux,
-        ReadTimeout:  time.Duration(cfg.Server.ReadTimeout) * time.Second,
-        WriteTimeout: time.Duration(cfg.Server.WriteTimeout) * time.Second,
-        IdleTimeout:  time.Duration(cfg.Server.IdleTimeout) * time.Second,
-    }
+	// Initialize load balancer
+	loadBalancer := loadbalancer.New(loadbalancer.Config{
+		Strategy:           cfg.LoadBalancer.Strategy,
+		HealthCheckEnabled: cfg.LoadBalancer.HealthCheckEnabled,
+		HealthCheckInterval: cfg.LoadBalancer.HealthCheckInterval,
+		Backends:           cfg.LoadBalancer.Backends,
+		Logger:             log,
+	})
 
-    return &Server{
-        config:          cfg,
-        logger:          logger,
-        wsManager:       wsManager,
-        router:          router,
-        securityManager: securityManager,
-        networkManager:  networkManager,
-        monitor:         monitor,
-        httpServer:      httpServer,
-        shutdownCh:      make(chan struct{}),
-    }, nil
+	return &Application{
+		config:          cfg,
+		logger:          log,
+		wsManager:       wsManager,
+		loadBalancer:    loadBalancer,
+		securityManager: securityManager,
+		monitoring:      monitor,
+	}, nil
 }
 
-func (s *Server) Start(ctx context.Context) error {
-    s.logger.Info("Starting AlgoVeda WebSocket Gateway", 
-        zap.String("version", s.config.Server.Version),
-        zap.Int("port", s.config.Server.Port))
+// Start starts all application components
+func (app *Application) Start() error {
+	ctx := context.Background()
 
-    // Start monitoring
-    if err := s.monitor.Start(ctx); err != nil {
-        return fmt.Errorf("failed to start monitoring: %w", err)
-    }
+	app.logger.Info("Starting AlgoVeda WebSocket Gateway")
 
-    // Start network manager
-    if err := s.networkManager.Start(ctx); err != nil {
-        return fmt.Errorf("failed to start network manager: %w", err)
-    }
+	// Start monitoring first
+	if err := app.monitoring.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start monitoring: %w", err)
+	}
 
-    // Start WebSocket manager
-    if err := s.wsManager.Start(ctx); err != nil {
-        return fmt.Errorf("failed to start WebSocket manager: %w", err)
-    }
+	// Start security manager
+	if err := app.securityManager.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start security manager: %w", err)
+	}
 
-    // Start message router
-    if err := s.router.Start(ctx); err != nil {
-        return fmt.Errorf("failed to start message router: %w", err)
-    }
+	// Start load balancer
+	if err := app.loadBalancer.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start load balancer: %w", err)
+	}
 
-    // Connect WebSocket manager to router
-    s.wsManager.SetMessageHandler(s.router.RouteMessage)
-    s.router.SetBroadcastHandler(s.wsManager.Broadcast)
+	// Start WebSocket manager
+	if err := app.wsManager.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start WebSocket manager: %w", err)
+	}
 
-    // Start HTTP server
-    go func() {
-        if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            s.logger.Error("HTTP server error", zap.Error(err))
-            close(s.shutdownCh)
-        }
-    }()
+	// Setup HTTP routes
+	if err := app.setupRoutes(); err != nil {
+		return fmt.Errorf("failed to setup routes: %w", err)
+	}
 
-    s.logger.Info("Server started successfully")
-    return nil
+	// Start HTTP server
+	if err := app.startHTTPServer(); err != nil {
+		return fmt.Errorf("failed to start HTTP server: %w", err)
+	}
+
+	// Start metrics server
+	if err := app.startMetricsServer(); err != nil {
+		return fmt.Errorf("failed to start metrics server: %w", err)
+	}
+
+	app.logger.Info("AlgoVeda WebSocket Gateway started successfully",
+		"http_port", app.config.Server.Port,
+		"metrics_port", app.config.Monitoring.MetricsPort,
+		"max_connections", app.config.WebSocket.MaxConnections)
+
+	return nil
 }
 
-func (s *Server) Shutdown(ctx context.Context) error {
-    s.shutdownOnce.Do(func() {
-        s.logger.Info("Starting graceful shutdown")
+// setupRoutes configures HTTP routes
+func (app *Application) setupRoutes() error {
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
 
-        // Shutdown HTTP server
-        if err := s.httpServer.Shutdown(ctx); err != nil {
-            s.logger.Error("Error shutting down HTTP server", zap.Error(err))
-        }
+	// Middleware
+	router.Use(gin.Recovery())
+	router.Use(app.loggingMiddleware())
+	router.Use(app.securityMiddleware())
+	router.Use(app.rateLimitMiddleware())
+	router.Use(app.corsMiddleware())
 
-        // Shutdown WebSocket manager
-        if err := s.wsManager.Shutdown(ctx); err != nil {
-            s.logger.Error("Error shutting down WebSocket manager", zap.Error(err))
-        }
+	// Health check endpoints
+	router.GET("/health", app.healthCheckHandler)
+	router.GET("/ready", app.readinessHandler)
+	router.GET("/live", app.livenessHandler)
 
-        // Shutdown message router
-        if err := s.router.Shutdown(ctx); err != nil {
-            s.logger.Error("Error shutting down message router", zap.Error(err))
-        }
+	// WebSocket endpoint
+	router.GET("/ws", app.websocketHandler)
 
-        // Shutdown network manager
-        if err := s.networkManager.Shutdown(ctx); err != nil {
-            s.logger.Error("Error shutting down network manager", zap.Error(err))
-        }
+	// API endpoints
+	api := router.Group("/api/v1")
+	{
+		api.GET("/stats", app.statsHandler)
+		api.GET("/connections", app.connectionsHandler)
+		api.POST("/broadcast", app.broadcastHandler)
+		api.GET("/subscriptions", app.subscriptionsHandler)
+		api.POST("/subscribe", app.subscribeHandler)
+		api.POST("/unsubscribe", app.unsubscribeHandler)
+	}
 
-        // Shutdown monitoring
-        if err := s.monitor.Shutdown(ctx); err != nil {
-            s.logger.Error("Error shutting down monitoring", zap.Error(err))
-        }
-    })
+	// Admin endpoints (protected)
+	admin := router.Group("/admin")
+	admin.Use(app.adminAuthMiddleware())
+	{
+		admin.GET("/metrics", gin.WrapH(promhttp.Handler()))
+		admin.GET("/config", app.configHandler)
+		admin.POST("/reload", app.reloadConfigHandler)
+		admin.POST("/shutdown", app.shutdownHandler)
+	}
 
-    return nil
+	app.httpServer = &http.Server{
+		Addr:           fmt.Sprintf(":%d", app.config.Server.Port),
+		Handler:        router,
+		ReadTimeout:    app.config.Server.ReadTimeout,
+		WriteTimeout:   app.config.Server.WriteTimeout,
+		IdleTimeout:    app.config.Server.IdleTimeout,
+		MaxHeaderBytes: app.config.Server.MaxHeaderBytes,
+	}
+
+	return nil
 }
 
-func initLogger(level, format string) (*zap.Logger, error) {
-    var config zap.Config
+// startHTTPServer starts the main HTTP server
+func (app *Application) startHTTPServer() error {
+	go func() {
+		app.logger.Info("Starting HTTP server", "port", app.config.Server.Port)
+		
+		if app.config.Server.TLS.Enabled {
+			if err := app.httpServer.ListenAndServeTLS(
+				app.config.Server.TLS.CertFile,
+				app.config.Server.TLS.KeyFile,
+			); err != nil && err != http.ErrServerClosed {
+				app.logger.Error("HTTP server error", "error", err)
+			}
+		} else {
+			if err := app.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				app.logger.Error("HTTP server error", "error", err)
+			}
+		}
+	}()
 
-    if format == "json" {
-        config = zap.NewProductionConfig()
-    } else {
-        config = zap.NewDevelopmentConfig()
-    }
-
-    // Set log level
-    switch level {
-    case "debug":
-        config.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
-    case "info":
-        config.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
-    case "warn":
-        config.Level = zap.NewAtomicLevelAt(zap.WarnLevel)
-    case "error":
-        config.Level = zap.NewAtomicLevelAt(zap.ErrorLevel)
-    default:
-        config.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
-    }
-
-    return config.Build()
+	return nil
 }
 
-func handleHealthCheck(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(http.StatusOK)
-    w.Write([]byte(`{"status":"healthy","timestamp":"` + time.Now().UTC().Format(time.RFC3339) + `"}`))
+// startMetricsServer starts the Prometheus metrics server
+func (app *Application) startMetricsServer() error {
+	metricsRouter := gin.New()
+	metricsRouter.Use(gin.Recovery())
+	metricsRouter.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	metricsRouter.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+
+	app.metricsServer = &http.Server{
+		Addr:    fmt.Sprintf(":%d", app.config.Monitoring.MetricsPort),
+		Handler: metricsRouter,
+	}
+
+	go func() {
+		app.logger.Info("Starting metrics server", "port", app.config.Monitoring.MetricsPort)
+		if err := app.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			app.logger.Error("Metrics server error", "error", err)
+		}
+	}()
+
+	return nil
 }
 
-// Additional helper functions and middleware would be implemented here...
+// WebSocket handler
+func (app *Application) websocketHandler(c *gin.Context) {
+	// Upgrade HTTP connection to WebSocket
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  app.config.WebSocket.ReadBufferSize,
+		WriteBufferSize: app.config.WebSocket.WriteBufferSize,
+		CheckOrigin: func(r *http.Request) bool {
+			return app.securityManager.CheckOrigin(r)
+		},
+		EnableCompression: app.config.WebSocket.CompressionEnabled,
+	}
+
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		app.logger.Error("WebSocket upgrade failed", "error", err, "remote_addr", c.ClientIP())
+		return
+	}
+
+	// Create client context
+	clientID := app.generateClientID()
+	client := &websocket.Client{
+		ID:         clientID,
+		Connection: conn,
+		RemoteAddr: c.ClientIP(),
+		UserAgent:  c.Request.UserAgent(),
+		Headers:    c.Request.Header,
+		ConnectedAt: time.Now(),
+	}
+
+	// Authenticate client
+	if err := app.securityManager.AuthenticateClient(client, c.Request); err != nil {
+		app.logger.Warn("Client authentication failed", 
+			"client_id", clientID, 
+			"remote_addr", c.ClientIP(), 
+			"error", err)
+		conn.Close()
+		return
+	}
+
+	// Register client with WebSocket manager
+	if err := app.wsManager.RegisterClient(client); err != nil {
+		app.logger.Error("Failed to register client", 
+			"client_id", clientID, 
+			"error", err)
+		conn.Close()
+		return
+	}
+
+	app.logger.Info("WebSocket client connected", 
+		"client_id", clientID, 
+		"remote_addr", c.ClientIP())
+
+	// Update metrics
+	app.monitoring.IncrementCounter("websocket_connections_total")
+	app.monitoring.SetGauge("websocket_active_connections", 
+		float64(app.wsManager.GetConnectionCount()))
+}
+
+// Middleware functions
+func (app *Application) loggingMiddleware() gin.HandlerFunc {
+	return gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
+		return fmt.Sprintf("%s - [%s] \"%s %s %s %d %s \"%s\" %s\"\n",
+			param.ClientIP,
+			param.TimeStamp.Format(time.RFC3339),
+			param.Method,
+			param.Path,
+			param.Request.Proto,
+			param.StatusCode,
+			param.Latency,
+			param.Request.UserAgent(),
+			param.ErrorMessage,
+		)
+	})
+}
+
+func (app *Application) securityMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Security headers
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("X-XSS-Protection", "1; mode=block")
+		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+
+		// Rate limiting check
+		if !app.securityManager.CheckRateLimit(c.ClientIP()) {
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error": "Rate limit exceeded",
+			})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+func (app *Application) rateLimitMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !app.securityManager.CheckRateLimit(c.ClientIP()) {
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error": "Rate limit exceeded",
+			})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+func (app *Application) corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		origin := c.Request.Header.Get("Origin")
+		if app.securityManager.IsAllowedOrigin(origin) {
+			c.Header("Access-Control-Allow-Origin", origin)
+			c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			c.Header("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-CSRF-Token")
+			c.Header("Access-Control-Allow-Credentials", "true")
+		}
+
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+
+		c.Next()
+	}
+}
+
+func (app *Application) adminAuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		token := c.GetHeader("Authorization")
+		if !app.securityManager.ValidateAdminToken(token) {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error": "Unauthorized",
+			})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// HTTP handlers
+func (app *Application) healthCheckHandler(c *gin.Context) {
+	status := app.getHealthStatus()
+	httpStatus := http.StatusOK
+	if status["status"] != "healthy" {
+		httpStatus = http.StatusServiceUnavailable
+	}
+	c.JSON(httpStatus, status)
+}
+
+func (app *Application) readinessHandler(c *gin.Context) {
+	ready := app.wsManager.IsReady() && 
+			app.loadBalancer.IsReady() && 
+			app.securityManager.IsReady()
+	
+	if ready {
+		c.JSON(http.StatusOK, gin.H{"status": "ready"})
+	} else {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready"})
+	}
+}
+
+func (app *Application) livenessHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "alive"})
+}
+
+func (app *Application) statsHandler(c *gin.Context) {
+	stats := app.wsManager.GetStats()
+	c.JSON(http.StatusOK, stats)
+}
+
+func (app *Application) connectionsHandler(c *gin.Context) {
+	connections := app.wsManager.GetConnections()
+	c.JSON(http.StatusOK, gin.H{
+		"connections": connections,
+		"count":       len(connections),
+	})
+}
+
+func (app *Application) broadcastHandler(c *gin.Context) {
+	var request struct {
+		Message string `json:"message" binding:"required"`
+		Channel string `json:"channel"`
+	}
+
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	count := app.wsManager.Broadcast(request.Channel, []byte(request.Message))
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Broadcast sent",
+		"recipients": count,
+	})
+}
+
+func (app *Application) subscriptionsHandler(c *gin.Context) {
+	subscriptions := app.wsManager.GetSubscriptions()
+	c.JSON(http.StatusOK, subscriptions)
+}
+
+func (app *Application) subscribeHandler(c *gin.Context) {
+	var request struct {
+		ClientID string `json:"client_id" binding:"required"`
+		Channel  string `json:"channel" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := app.wsManager.Subscribe(request.ClientID, request.Channel); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Subscribed successfully"})
+}
+
+func (app *Application) unsubscribeHandler(c *gin.Context) {
+	var request struct {
+		ClientID string `json:"client_id" binding:"required"`
+		Channel  string `json:"channel" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := app.wsManager.Unsubscribe(request.ClientID, request.Channel); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Unsubscribed successfully"})
+}
+
+func (app *Application) configHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, app.config)
+}
+
+func (app *Application) reloadConfigHandler(c *gin.Context) {
+	newConfig, err := config.Load(*configFile)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to reload config: " + err.Error(),
+		})
+		return
+	}
+
+	app.config = newConfig
+	c.JSON(http.StatusOK, gin.H{"message": "Configuration reloaded"})
+}
+
+func (app *Application) shutdownHandler(c *gin.Context) {
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		app.Shutdown()
+	}()
+	c.JSON(http.StatusOK, gin.H{"message": "Shutdown initiated"})
+}
+
+// Helper functions
+func (app *Application) generateClientID() string {
+	return fmt.Sprintf("client_%d_%d", time.Now().UnixNano(), 
+		app.wsManager.GetConnectionCount()+1)
+}
+
+func (app *Application) getHealthStatus() map[string]interface{} {
+	status := map[string]interface{}{
+		"status":    "healthy",
+		"timestamp": time.Now().UTC(),
+		"version":   app.config.App.Version,
+		"uptime":    time.Since(app.monitoring.GetStartTime()).String(),
+	}
+
+	// Check component health
+	checks := map[string]bool{
+		"websocket_manager": app.wsManager.IsHealthy(),
+		"load_balancer":     app.loadBalancer.IsHealthy(),
+		"security_manager":  app.securityManager.IsHealthy(),
+		"monitoring":        app.monitoring.IsHealthy(),
+	}
+
+	allHealthy := true
+	for component, healthy := range checks {
+		status[component] = map[string]interface{}{
+			"healthy": healthy,
+		}
+		if !healthy {
+			allHealthy = false
+		}
+	}
+
+	if !allHealthy {
+		status["status"] = "unhealthy"
+	}
+
+	return status
+}
+
+// WaitForShutdown waits for shutdown signals
+func (app *Application) WaitForShutdown() {
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	sig := <-quit
+	app.logger.Info("Received shutdown signal", "signal", sig.String())
+
+	app.Shutdown()
+}
+
+// Shutdown gracefully shuts down the application
+func (app *Application) Shutdown() {
+	app.logger.Info("Shutting down AlgoVeda WebSocket Gateway")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Shutdown HTTP servers
+	if app.httpServer != nil {
+		if err := app.httpServer.Shutdown(ctx); err != nil {
+			app.logger.Error("HTTP server shutdown error", "error", err)
+		}
+	}
+
+	if app.metricsServer != nil {
+		if err := app.metricsServer.Shutdown(ctx); err != nil {
+			app.logger.Error("Metrics server shutdown error", "error", err)
+		}
+	}
+
+	// Shutdown components
+	if app.wsManager != nil {
+		app.wsManager.Shutdown(ctx)
+	}
+
+	if app.loadBalancer != nil {
+		app.loadBalancer.Shutdown(ctx)
+	}
+
+	if app.securityManager != nil {
+		app.securityManager.Shutdown(ctx)
+	}
+
+	if app.monitoring != nil {
+		app.monitoring.Shutdown(ctx)
+	}
+
+	app.logger.Info("AlgoVeda WebSocket Gateway shutdown complete")
+}
