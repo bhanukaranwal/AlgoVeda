@@ -1,0 +1,68 @@
+# Complete Prometheus Configuration for AlgoVeda Platform[9][17]
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    cluster: 'algoveda-prod'
+    replica: 'prometheus-01'
+
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+scrape_configs:
+  # AlgoVeda Core Engine
+  - job_name: 'algoveda-core'
+    static_configs:
+      - targets: ['algoveda-core:9090']
+    metrics_path: '/metrics'
+    scrape_interval: 1s
+    scrape_timeout: 500ms
+    honor_labels: true
+    
+  # WebSocket Gateway
+  - job_name: 'websocket-gateway'
+    static_configs:
+      - targets: ['websocket-gateway:9091']
+    
+  # Kubernetes Pods
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+        
+  # Node Exporter
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    
+  # PostgreSQL
+  - job_name: 'postgres-exporter'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+    
+  # Redis
+  - job_name: 'redis-exporter'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+# Recording rules for performance optimization
+recording_rules:
+  - name: algoveda.rules
+    rules:
+      - record: algoveda:order_rate_5m
+        expr: rate(algoveda_orders_total[5m])
+      - record: algoveda:latency_p99_5m
+        expr: histogram_quantile(0.99, rate(algoveda_request_duration_seconds_bucket[5m]))
