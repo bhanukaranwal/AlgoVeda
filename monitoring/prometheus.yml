@@ -1,0 +1,104 @@
+# Prometheus configuration for AlgoVeda platform monitoring
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'algoveda-production'
+    replica: 'prometheus-1'
+
+rule_files:
+  - "rules/*.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+scrape_configs:
+  # AlgoVeda Core Service
+  - job_name: 'algoveda-core'
+    static_configs:
+      - targets: ['algoveda-core:9090']
+    scrape_interval: 5s
+    metrics_path: /metrics
+    honor_labels: true
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: '([^:]+):.*'
+        replacement: '${1}'
+
+  # PostgreSQL Exporter
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+    scrape_interval: 15s
+
+  # Redis Exporter  
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+    scrape_interval: 15s
+
+  # Node Exporter
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    scrape_interval: 30s
+
+  # WebSocket Gateway Metrics
+  - job_name: 'websocket-gateway'
+    static_configs:
+      - targets: ['algoveda-core:8080']
+    metrics_path: /ws/metrics
+    scrape_interval: 10s
+
+  # Trading Metrics
+  - job_name: 'trading-metrics'
+    static_configs:
+      - targets: ['algoveda-core:8080']
+    metrics_path: /api/v1/metrics/trading
+    scrape_interval: 5s
+    honor_labels: true
+
+  # Risk Metrics
+  - job_name: 'risk-metrics'
+    static_configs:
+      - targets: ['algoveda-core:8080']
+    metrics_path: /api/v1/metrics/risk
+    scrape_interval: 15s
+
+  # GPU Metrics (if available)
+  - job_name: 'gpu-metrics'
+    static_configs:
+      - targets: ['nvidia-smi-exporter:9445']
+    scrape_interval: 30s
+
+  # ClickHouse Metrics
+  - job_name: 'clickhouse'
+    static_configs:
+      - targets: ['clickhouse:8123']
+    metrics_path: /metrics
+    scrape_interval: 30s
+
+  # Nginx Metrics
+  - job_name: 'nginx'
+    static_configs:
+      - targets: ['nginx-exporter:9113']
+    scrape_interval: 30s
+
+# Remote write configuration (optional - for long-term storage)
+remote_write:
+  - url: "http://victoriametrics:8428/api/v1/write"
+    queue_config:
+      max_samples_per_send: 10000
+      batch_send_deadline: 5s
+      max_shards: 200
+
+# Storage configuration
+storage:
+  tsdb:
+    retention.time: 15d
+    retention.size: 50GB
+    path: /prometheus/data
