@@ -1,0 +1,61 @@
+# Kubernetes deployment with high availability and auto-scaling
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: algoveda-core
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: algoveda-core
+  template:
+    spec:
+      containers:
+      - name: algoveda-core
+        image: algoveda/platform:latest
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        env:
+        - name: RUST_LOG
+          value: "info"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: db-secret
+              key: url
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: algoveda-service
+spec:
+  selector:
+    app: algoveda-core
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: LoadBalancer
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: algoveda-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: algoveda-core
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
