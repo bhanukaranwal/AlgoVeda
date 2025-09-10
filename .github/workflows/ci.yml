@@ -1,0 +1,49 @@
+name: AlgoVeda CI/CD Pipeline
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-rust:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+    - name: Run Rust tests
+      run: cd core-engine && cargo test --release
+    
+  test-python:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    - name: Install dependencies
+      run: pip install -r requirements-dev.txt
+    - name: Run Python tests
+      run: cd src/python && pytest -xvs
+
+  test-typescript:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+    - name: Install dependencies
+      run: cd frontend && npm install
+    - name: Run TypeScript tests
+      run: cd frontend && npm test
+
+  build-docker:
+    needs: [test-rust, test-python, test-typescript]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build Docker image
+      run: docker build -t algoveda/platform:${{ github.sha }} .
