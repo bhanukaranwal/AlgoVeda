@@ -1,605 +1,611 @@
+/*
+ * WebSocket Connection Manager
+ * High-performance connection management with load balancing
+ */
+
 package websocket
 
 import (
-    "context"
-    "encoding/json"
-    "fmt"
-    "net/http"
-    "sync"
-    "sync/atomic"
-    "time"
+	"context"
+	"encoding/json"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
 
-    "github.com/gorilla/websocket"
-    "go.uber.org/zap"
+	"github.com/gorilla/websocket"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
 
-    "github.com/algoveda/websocket-gateway/internal/config"
-    "github.com/algoveda/websocket-gateway/internal/monitoring"
-    "github.com/algoveda/websocket-gateway/internal/security"
+	"algoveda/internal/monitoring"
+	"algoveda/internal/security"
+	"algoveda/pkg/logger"
 )
 
+// ConnectionManager manages WebSocket connections
 type ConnectionManager struct {
-    config          *config.WebSocketConfig
-    logger          *zap.Logger
-    monitor         *monitoring.Monitor
-    security        *security.Manager
-    upgrader        *websocket.Upgrader
-    connections     sync.Map // map[string]*Connection
-    subscriptions   sync.Map // map[string]map[string]*Connection
-    messageHandler  MessageHandler
-    metrics         *Metrics
-    shutdownCh      chan struct{}
-    wg              sync.WaitGroup
+	// Configuration
+	config Config
+	logger *logger.Logger
+	
+	// Connection management
+	connections     sync.Map              // map[string]*Client
+	subscriptions   sync.Map              // map[string]map[string]*Client (channel -> clientID -> client)
+	connectionCount int64
+	
+	// Message routing
+	messageRouter   *MessageRouter
+	loadBalancer   *LoadBalancer
+	
+	// Monitoring and security
+	metrics         *monitoring.Metrics
+	securityManager *security.Manager
+	
+	// Channels
+	register     chan *Client
+	unregister   chan *Client
+	broadcast    chan *BroadcastMessage
+	
+	// Lifecycle
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	
+	// Performance monitoring
+	messagesSent     int64
+	messagesReceived int64
+	bytesTransferred int64
 }
 
-type Connection struct {
-    ID              string
-    UserID          string
-    SessionID       string
-    RemoteAddr      string
-    UserAgent       string
-    ConnectedAt     time.Time
-    LastActivity    time.Time
-    conn            *websocket.Conn
-    writeMutex      sync.Mutex
-    readMutex       sync.Mutex
-    subscriptions   map[string]bool
-    rateLimiter     *RateLimiter
-    messageQueue    chan *Message
-    closeOnce       sync.Once
-    closeCh         chan struct{}
-    manager         *ConnectionManager
+// Client represents a WebSocket client connection
+type Client struct {
+	ID              string                 `json:"id"`
+	Connection      *websocket.Conn        `json:"-"`
+	RemoteAddr      string                 `json:"remote_addr"`
+	UserAgent       string                 `json:"user_agent"`
+	Headers         map[string][]string    `json:"headers"`
+	ConnectedAt     time.Time              `json:"connected_at"`
+	LastActivity    time.Time              `json:"last_activity"`
+	Subscriptions   map[string]bool        `json:"subscriptions"`
+	Authenticated   bool                   `json:"authenticated"`
+	UserID          string                 `json:"user_id,omitempty"`
+	
+	// Connection state
+	send         chan []byte
+	closed       int32
+	pingTicker   *time.Ticker
+	pongWait     time.Duration
+	writeWait    time.Duration
+	maxMessageSize int64
+	
+	// Statistics
+	MessagesSent     int64 `json:"messages_sent"`
+	MessagesReceived int64 `json:"messages_received"`
+	BytesTransferred int64 `json:"bytes_transferred"`
 }
 
-type Message struct {
-    Type      string          `json:"type"`
-    Topic     string          `json:"topic,omitempty"`
-    Data      json.RawMessage `json:"data"`
-    Timestamp int64           `json:"timestamp"`
-    RequestID string          `json:"request_id,omitempty"`
+// BroadcastMessage represents a message to broadcast
+type BroadcastMessage struct {
+	Channel string
+	Data    []byte
+	Exclude []string // Client IDs to exclude
 }
 
-type MessageHandler func(conn *Connection, msg *Message) error
-
-type Metrics struct {
-    ActiveConnections   int64
-    TotalConnections    int64
-    MessagesReceived    int64
-    MessagesSent        int64
-    BytesReceived       int64
-    BytesSent          int64
-    ConnectionErrors    int64
-    MessageErrors      int64
+// Config holds connection manager configuration
+type Config struct {
+	MaxConnections     int           `yaml:"max_connections"`
+	ReadBufferSize     int           `yaml:"read_buffer_size"`
+	WriteBufferSize    int           `yaml:"write_buffer_size"`
+	WriteTimeout       time.Duration `yaml:"write_timeout"`
+	ReadTimeout        time.Duration `yaml:"read_timeout"`
+	PingInterval       time.Duration `yaml:"ping_interval"`
+	MaxMessageSize     int64         `yaml:"max_message_size"`
+	CompressionEnabled bool          `yaml:"compression_enabled"`
+	
+	Logger             *logger.Logger
+	Monitor            *monitoring.Metrics
+	SecurityManager    *security.Manager
 }
 
-type RateLimiter struct {
-    maxRequests int
-    window      time.Duration
-    requests    []time.Time
-    mutex       sync.Mutex
+// NewConnectionManager creates a new connection manager
+func NewConnectionManager(config Config) *ConnectionManager {
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	cm := &ConnectionManager{
+		config:          config,
+		logger:          config.Logger,
+		metrics:         config.Monitor,
+		securityManager: config.SecurityManager,
+		
+		register:   make(chan *Client, 1000),
+		unregister: make(chan *Client, 1000),
+		broadcast:  make(chan *BroadcastMessage, 10000),
+		
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	
+	// Initialize message router
+	cm.messageRouter = NewMessageRouter(MessageRouterConfig{
+		Logger:  config.Logger,
+		Monitor: config.Monitor,
+	})
+	
+	// Initialize load balancer
+	cm.loadBalancer = NewLoadBalancer(LoadBalancerConfig{
+		Logger: config.Logger,
+	})
+	
+	return cm
 }
 
-func NewConnectionManager(
-    config *config.WebSocketConfig,
-    logger *zap.Logger,
-    monitor *monitoring.Monitor,
-    security *security.Manager,
-) (*ConnectionManager, error) {
-    upgrader := &websocket.Upgrader{
-        ReadBufferSize:  config.ReadBufferSize,
-        WriteBufferSize: config.WriteBufferSize,
-        CheckOrigin: func(r *http.Request) bool {
-            // Implement origin checking logic
-            return true // For now, allow all origins
-        },
-        EnableCompression: config.EnableCompression,
-    }
-
-    cm := &ConnectionManager{
-        config:     config,
-        logger:     logger,
-        monitor:    monitor,
-        security:   security,
-        upgrader:   upgrader,
-        metrics:    &Metrics{},
-        shutdownCh: make(chan struct{}),
-    }
-
-    return cm, nil
-}
-
+// Start starts the connection manager
 func (cm *ConnectionManager) Start(ctx context.Context) error {
-    cm.logger.Info("Starting WebSocket connection manager")
-
-    // Start metrics reporting goroutine
-    cm.wg.Add(1)
-    go cm.metricsReporter(ctx)
-
-    // Start connection cleanup goroutine
-    cm.wg.Add(1)
-    go cm.connectionCleaner(ctx)
-
-    return nil
+	cm.logger.Info("Starting WebSocket connection manager")
+	
+	// Start message router
+	if err := cm.messageRouter.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start message router: %w", err)
+	}
+	
+	// Start load balancer
+	if err := cm.loadBalancer.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start load balancer: %w", err)
+	}
+	
+	// Start connection manager loop
+	cm.wg.Add(1)
+	go cm.run()
+	
+	return nil
 }
 
-func (cm *ConnectionManager) Shutdown(ctx context.Context) error {
-    cm.logger.Info("Shutting down WebSocket connection manager")
-    
-    close(cm.shutdownCh)
-
-    // Close all connections
-    cm.connections.Range(func(key, value interface{}) bool {
-        if conn, ok := value.(*Connection); ok {
-            conn.Close()
-        }
-        return true
-    })
-
-    // Wait for goroutines to finish
-    done := make(chan struct{})
-    go func() {
-        cm.wg.Wait()
-        close(done)
-    }()
-
-    select {
-    case <-done:
-        cm.logger.Info("All goroutines stopped")
-    case <-ctx.Done():
-        cm.logger.Warn("Shutdown timeout reached, forcing exit")
-    }
-
-    return nil
+// RegisterClient registers a new WebSocket client
+func (cm *ConnectionManager) RegisterClient(client *Client) error {
+	// Check connection limits
+	if atomic.LoadInt64(&cm.connectionCount) >= int64(cm.config.MaxConnections) {
+		return fmt.Errorf("maximum connection limit reached")
+	}
+	
+	// Initialize client
+	client.send = make(chan []byte, 256)
+	client.Subscriptions = make(map[string]bool)
+	client.pongWait = cm.config.ReadTimeout
+	client.writeWait = cm.config.WriteTimeout
+	client.maxMessageSize = cm.config.MaxMessageSize
+	
+	// Configure WebSocket connection
+	client.Connection.SetReadLimit(cm.config.MaxMessageSize)
+	client.Connection.SetReadDeadline(time.Now().Add(client.pongWait))
+	client.Connection.SetPongHandler(func(string) error {
+		client.Connection.SetReadDeadline(time.Now().Add(client.pongWait))
+		client.LastActivity = time.Now()
+		return nil
+	})
+	
+	// Register client
+	select {
+	case cm.register <- client:
+		return nil
+	default:
+		return fmt.Errorf("registration queue full")
+	}
 }
 
-func (cm *ConnectionManager) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
-    // Security checks
-    if !cm.security.ValidateRequest(r) {
-        http.Error(w, "Unauthorized", http.StatusUnauthorized)
-        return
-    }
-
-    // Rate limiting
-    clientIP := cm.getClientIP(r)
-    if !cm.security.CheckRateLimit(clientIP) {
-        http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
-        return
-    }
-
-    // Upgrade connection
-    conn, err := cm.upgrader.Upgrade(w, r, nil)
-    if err != nil {
-        cm.logger.Error("Failed to upgrade connection", zap.Error(err))
-        atomic.AddInt64(&cm.metrics.ConnectionErrors, 1)
-        return
-    }
-
-    // Create connection object
-    connection := cm.createConnection(conn, r)
-    
-    // Store connection
-    cm.connections.Store(connection.ID, connection)
-    atomic.AddInt64(&cm.metrics.ActiveConnections, 1)
-    atomic.AddInt64(&cm.metrics.TotalConnections, 1)
-
-    cm.logger.Info("New WebSocket connection established",
-        zap.String("connection_id", connection.ID),
-        zap.String("remote_addr", connection.RemoteAddr),
-        zap.String("user_id", connection.UserID))
-
-    // Start connection handlers
-    go connection.readPump()
-    go connection.writePump()
+// UnregisterClient unregisters a WebSocket client
+func (cm *ConnectionManager) UnregisterClient(clientID string) {
+	if client, ok := cm.connections.Load(clientID); ok {
+		cm.unregister <- client.(*Client)
+	}
 }
 
-func (cm *ConnectionManager) createConnection(conn *websocket.Conn, r *http.Request) *Connection {
-    connectionID := generateConnectionID()
-    userID := cm.getUserID(r)
-    sessionID := cm.getSessionID(r)
-
-    return &Connection{
-        ID:            connectionID,
-        UserID:        userID,
-        SessionID:     sessionID,
-        RemoteAddr:    cm.getClientIP(r),
-        UserAgent:     r.UserAgent(),
-        ConnectedAt:   time.Now(),
-        LastActivity:  time.Now(),
-        conn:          conn,
-        subscriptions: make(map[string]bool),
-        rateLimiter:   NewRateLimiter(cm.config.RateLimit.MaxRequests, cm.config.RateLimit.Window),
-        messageQueue:  make(chan *Message, cm.config.MessageQueueSize),
-        closeCh:       make(chan struct{}),
-        manager:       cm,
-    }
+// Broadcast sends a message to all clients on a channel
+func (cm *ConnectionManager) Broadcast(channel string, data []byte, exclude ...string) int {
+	msg := &BroadcastMessage{
+		Channel: channel,
+		Data:    data,
+		Exclude: exclude,
+	}
+	
+	select {
+	case cm.broadcast <- msg:
+		return cm.getChannelSubscriberCount(channel)
+	default:
+		cm.logger.Warn("Broadcast queue full, dropping message")
+		return 0
+	}
 }
 
-func (c *Connection) readPump() {
-    defer func() {
-        c.manager.removeConnection(c)
-        c.conn.Close()
-    }()
-
-    c.conn.SetReadLimit(int64(c.manager.config.MaxMessageSize))
-    c.conn.SetReadDeadline(time.Now().Add(c.manager.config.ReadTimeout))
-    c.conn.SetPongHandler(func(string) error {
-        c.conn.SetReadDeadline(time.Now().Add(c.manager.config.ReadTimeout))
-        return nil
-    })
-
-    for {
-        select {
-        case <-c.closeCh:
-            return
-        default:
-        }
-
-        _, messageData, err := c.conn.ReadMessage()
-        if err != nil {
-            if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-                c.manager.logger.Error("WebSocket read error", 
-                    zap.String("connection_id", c.ID),
-                    zap.Error(err))
-            }
-            return
-        }
-
-        atomic.AddInt64(&c.manager.metrics.MessagesReceived, 1)
-        atomic.AddInt64(&c.manager.metrics.BytesReceived, int64(len(messageData)))
-        c.LastActivity = time.Now()
-
-        // Rate limiting
-        if !c.rateLimiter.Allow() {
-            c.manager.logger.Warn("Rate limit exceeded for connection",
-                zap.String("connection_id", c.ID))
-            continue
-        }
-
-        // Parse message
-        var msg Message
-        if err := json.Unmarshal(messageData, &msg); err != nil {
-            c.manager.logger.Error("Failed to parse message",
-                zap.String("connection_id", c.ID),
-                zap.Error(err))
-            atomic.AddInt64(&c.manager.metrics.MessageErrors, 1)
-            continue
-        }
-
-        msg.Timestamp = time.Now().UnixNano()
-
-        // Handle message
-        if c.manager.messageHandler != nil {
-            if err := c.manager.messageHandler(c, &msg); err != nil {
-                c.manager.logger.Error("Message handler error",
-                    zap.String("connection_id", c.ID),
-                    zap.Error(err))
-                atomic.AddInt64(&c.manager.metrics.MessageErrors, 1)
-            }
-        }
-    }
+// Subscribe subscribes a client to a channel
+func (cm *ConnectionManager) Subscribe(clientID, channel string) error {
+	clientInterface, ok := cm.connections.Load(clientID)
+	if !ok {
+		return fmt.Errorf("client not found")
+	}
+	
+	client := clientInterface.(*Client)
+	
+	// Add to client subscriptions
+	client.Subscriptions[channel] = true
+	
+	// Add to channel subscriptions
+	channelSubs, _ := cm.subscriptions.LoadOrStore(channel, &sync.Map{})
+	channelSubs.(*sync.Map).Store(clientID, client)
+	
+	cm.logger.Debug("Client subscribed to channel",
+		zap.String("client_id", clientID),
+		zap.String("channel", channel))
+	
+	// Update metrics
+	cm.metrics.IncrementCounter("websocket_subscriptions_total")
+	
+	return nil
 }
 
-func (c *Connection) writePump() {
-    ticker := time.NewTicker(c.manager.config.PingPeriod)
-    defer func() {
-        ticker.Stop()
-        c.conn.Close()
-    }()
-
-    for {
-        select {
-        case message, ok := <-c.messageQueue:
-            c.conn.SetWriteDeadline(time.Now().Add(c.manager.config.WriteTimeout))
-            if !ok {
-                c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-                return
-            }
-
-            if err := c.writeMessage(message); err != nil {
-                c.manager.logger.Error("Write message error",
-                    zap.String("connection_id", c.ID),
-                    zap.Error(err))
-                return
-            }
-
-        case <-ticker.C:
-            c.conn.SetWriteDeadline(time.Now().Add(c.manager.config.WriteTimeout))
-            if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-                return
-            }
-
-        case <-c.closeCh:
-            return
-        }
-    }
+// Unsubscribe unsubscribes a client from a channel
+func (cm *ConnectionManager) Unsubscribe(clientID, channel string) error {
+	clientInterface, ok := cm.connections.Load(clientID)
+	if !ok {
+		return fmt.Errorf("client not found")
+	}
+	
+	client := clientInterface.(*Client)
+	
+	// Remove from client subscriptions
+	delete(client.Subscriptions, channel)
+	
+	// Remove from channel subscriptions
+	if channelSubs, ok := cm.subscriptions.Load(channel); ok {
+		channelSubs.(*sync.Map).Delete(clientID)
+	}
+	
+	cm.logger.Debug("Client unsubscribed from channel",
+		zap.String("client_id", clientID),
+		zap.String("channel", channel))
+	
+	// Update metrics
+	cm.metrics.IncrementCounter("websocket_unsubscriptions_total")
+	
+	return nil
 }
 
-func (c *Connection) writeMessage(msg *Message) error {
-    c.writeMutex.Lock()
-    defer c.writeMutex.Unlock()
-
-    data, err := json.Marshal(msg)
-    if err != nil {
-        return err
-    }
-
-    if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-        return err
-    }
-
-    atomic.AddInt64(&c.manager.metrics.MessagesSent, 1)
-    atomic.AddInt64(&c.manager.metrics.BytesSent, int64(len(data)))
-    return nil
+// SendToClient sends a message to a specific client
+func (cm *ConnectionManager) SendToClient(clientID string, data []byte) error {
+	clientInterface, ok := cm.connections.Load(clientID)
+	if !ok {
+		return fmt.Errorf("client not found")
+	}
+	
+	client := clientInterface.(*Client)
+	
+	select {
+	case client.send <- data:
+		return nil
+	default:
+		// Client send buffer is full, disconnect
+		cm.logger.Warn("Client send buffer full, disconnecting",
+			zap.String("client_id", clientID))
+		go cm.UnregisterClient(clientID)
+		return fmt.Errorf("client send buffer full")
+	}
 }
 
-func (c *Connection) SendMessage(msg *Message) error {
-    select {
-    case c.messageQueue <- msg:
-        return nil
-    case <-c.closeCh:
-        return fmt.Errorf("connection closed")
-    default:
-        return fmt.Errorf("message queue full")
-    }
+// GetConnections returns all active connections
+func (cm *ConnectionManager) GetConnections() []Client {
+	var connections []Client
+	
+	cm.connections.Range(func(key, value interface{}) bool {
+		client := value.(*Client)
+		connections = append(connections, *client)
+		return true
+	})
+	
+	return connections
 }
 
-func (c *Connection) Subscribe(topic string) error {
-    c.subscriptions[topic] = true
-    
-    // Add to global subscriptions map
-    subs, _ := c.manager.subscriptions.LoadOrStore(topic, make(map[string]*Connection))
-    if subMap, ok := subs.(map[string]*Connection); ok {
-        subMap[c.ID] = c
-    }
-
-    c.manager.logger.Debug("Connection subscribed to topic",
-        zap.String("connection_id", c.ID),
-        zap.String("topic", topic))
-    
-    return nil
+// GetConnectionCount returns the current connection count
+func (cm *ConnectionManager) GetConnectionCount() int {
+	return int(atomic.LoadInt64(&cm.connectionCount))
 }
 
-func (c *Connection) Unsubscribe(topic string) error {
-    delete(c.subscriptions, topic)
-    
-    // Remove from global subscriptions map
-    if subs, ok := c.manager.subscriptions.Load(topic); ok {
-        if subMap, ok := subs.(map[string]*Connection); ok {
-            delete(subMap, c.ID)
-        }
-    }
-
-    c.manager.logger.Debug("Connection unsubscribed from topic",
-        zap.String("connection_id", c.ID),
-        zap.String("topic", topic))
-    
-    return nil
+// GetSubscriptions returns subscription information
+func (cm *ConnectionManager) GetSubscriptions() map[string][]string {
+	subscriptions := make(map[string][]string)
+	
+	cm.subscriptions.Range(func(key, value interface{}) bool {
+		channel := key.(string)
+		channelSubs := value.(*sync.Map)
+		
+		var subscribers []string
+		channelSubs.Range(func(clientKey, clientValue interface{}) bool {
+			subscribers = append(subscribers, clientKey.(string))
+			return true
+		})
+		
+		subscriptions[channel] = subscribers
+		return true
+	})
+	
+	return subscriptions
 }
 
-func (c *Connection) Close() {
-    c.closeOnce.Do(func() {
-        close(c.closeCh)
-        close(c.messageQueue)
-        
-        // Unsubscribe from all topics
-        for topic := range c.subscriptions {
-            c.Unsubscribe(topic)
-        }
-    })
+// GetStats returns connection manager statistics
+func (cm *ConnectionManager) GetStats() map[string]interface{} {
+	return map[string]interface{}{
+		"active_connections":  atomic.LoadInt64(&cm.connectionCount),
+		"messages_sent":       atomic.LoadInt64(&cm.messagesSent),
+		"messages_received":   atomic.LoadInt64(&cm.messagesReceived),
+		"bytes_transferred":   atomic.LoadInt64(&cm.bytesTransferred),
+		"subscription_count":  cm.getSubscriptionCount(),
+	}
 }
 
-func (cm *ConnectionManager) SetMessageHandler(handler MessageHandler) {
-    cm.messageHandler = handler
+// IsHealthy returns the health status
+func (cm *ConnectionManager) IsHealthy() bool {
+	return cm.ctx.Err() == nil
 }
 
-func (cm *ConnectionManager) Broadcast(topic string, msg *Message) error {
-    if subs, ok := cm.subscriptions.Load(topic); ok {
-        if subMap, ok := subs.(map[string]*Connection); ok {
-            for _, conn := range subMap {
-                if err := conn.SendMessage(msg); err != nil {
-                    cm.logger.Warn("Failed to send broadcast message",
-                        zap.String("connection_id", conn.ID),
-                        zap.String("topic", topic),
-                        zap.Error(err))
-                }
-            }
-        }
-    }
-    return nil
+// IsReady returns the readiness status
+func (cm *ConnectionManager) IsReady() bool {
+	return cm.IsHealthy()
 }
 
-func (cm *ConnectionManager) GetConnection(connectionID string) (*Connection, bool) {
-    if conn, ok := cm.connections.Load(connectionID); ok {
-        return conn.(*Connection), true
-    }
-    return nil, false
+// Shutdown gracefully shuts down the connection manager
+func (cm *ConnectionManager) Shutdown(ctx context.Context) {
+	cm.logger.Info("Shutting down WebSocket connection manager")
+	
+	// Cancel context
+	cm.cancel()
+	
+	// Close all client connections
+	cm.connections.Range(func(key, value interface{}) bool {
+		client := value.(*Client)
+		cm.closeClient(client)
+		return true
+	})
+	
+	// Wait for goroutines to finish
+	cm.wg.Wait()
+	
+	cm.logger.Info("WebSocket connection manager shutdown complete")
 }
 
-func (cm *ConnectionManager) GetConnectionsByUser(userID string) []*Connection {
-    var connections []*Connection
-    cm.connections.Range(func(key, value interface{}) bool {
-        if conn, ok := value.(*Connection); ok && conn.UserID == userID {
-            connections = append(connections, conn)
-        }
-        return true
-    })
-    return connections
+// Main event loop
+func (cm *ConnectionManager) run() {
+	defer cm.wg.Done()
+	
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-cm.ctx.Done():
+			return
+			
+		case client := <-cm.register:
+			cm.handleClientRegistration(client)
+			
+		case client := <-cm.unregister:
+			cm.handleClientUnregistration(client)
+			
+		case message := <-cm.broadcast:
+			cm.handleBroadcast(message)
+			
+		case <-ticker.C:
+			cm.cleanup()
+		}
+	}
 }
 
-func (cm *ConnectionManager) removeConnection(conn *Connection) {
-    cm.connections.Delete(conn.ID)
-    atomic.AddInt64(&cm.metrics.ActiveConnections, -1)
-    
-    cm.logger.Info("WebSocket connection closed",
-        zap.String("connection_id", conn.ID),
-        zap.String("user_id", conn.UserID),
-        zap.Duration("duration", time.Since(conn.ConnectedAt)))
+// Handle client registration
+func (cm *ConnectionManager) handleClientRegistration(client *Client) {
+	// Store client connection
+	cm.connections.Store(client.ID, client)
+	atomic.AddInt64(&cm.connectionCount, 1)
+	
+	// Start client goroutines
+	cm.wg.Add(2)
+	go cm.clientReader(client)
+	go cm.clientWriter(client)
+	
+	cm.logger.Info("Client registered",
+		zap.String("client_id", client.ID),
+		zap.String("remote_addr", client.RemoteAddr),
+		zap.Int("total_connections", int(atomic.LoadInt64(&cm.connectionCount))))
+	
+	// Update metrics
+	cm.metrics.IncrementCounter("websocket_connections_total")
+	cm.metrics.SetGauge("websocket_active_connections", 
+		float64(atomic.LoadInt64(&cm.connectionCount)))
 }
 
-func (cm *ConnectionManager) metricsReporter(ctx context.Context) {
-    defer cm.wg.Done()
-    
-    ticker := time.NewTicker(30 * time.Second)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-ticker.C:
-            cm.reportMetrics()
-        case <-ctx.Done():
-            return
-        case <-cm.shutdownCh:
-            return
-        }
-    }
+// Handle client unregistration
+func (cm *ConnectionManager) handleClientUnregistration(client *Client) {
+	// Remove from connections
+	if _, ok := cm.connections.LoadAndDelete(client.ID); ok {
+		atomic.AddInt64(&cm.connectionCount, -1)
+	}
+	
+	// Remove from all subscriptions
+	cm.subscriptions.Range(func(key, value interface{}) bool {
+		channelSubs := value.(*sync.Map)
+		channelSubs.Delete(client.ID)
+		return true
+	})
+	
+	// Close client connection
+	cm.closeClient(client)
+	
+	cm.logger.Info("Client unregistered",
+		zap.String("client_id", client.ID),
+		zap.Int("total_connections", int(atomic.LoadInt64(&cm.connectionCount))))
+	
+	// Update metrics
+	cm.metrics.IncrementCounter("websocket_disconnections_total")
+	cm.metrics.SetGauge("websocket_active_connections", 
+		float64(atomic.LoadInt64(&cm.connectionCount)))
 }
 
-func (cm *ConnectionManager) connectionCleaner(ctx context.Context) {
-    defer cm.wg.Done()
-    
-    ticker := time.NewTicker(5 * time.Minute)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-ticker.C:
-            cm.cleanupStaleConnections()
-        case <-ctx.Done():
-            return
-        case <-cm.shutdownCh:
-            return
-        }
-    }
+// Handle broadcast message
+func (cm *ConnectionManager) handleBroadcast(message *BroadcastMessage) {
+	if channelSubs, ok := cm.subscriptions.Load(message.Channel); ok {
+		excludeMap := make(map[string]bool)
+		for _, clientID := range message.Exclude {
+			excludeMap[clientID] = true
+		}
+		
+		sent := 0
+		channelSubs.(*sync.Map).Range(func(key, value interface{}) bool {
+			clientID := key.(string)
+			if !excludeMap[clientID] {
+				client := value.(*Client)
+				select {
+				case client.send <- message.Data:
+					sent++
+				default:
+					// Client buffer full, skip
+				}
+			}
+			return true
+		})
+		
+		atomic.AddInt64(&cm.messagesSent, int64(sent))
+		atomic.AddInt64(&cm.bytesTransferred, int64(len(message.Data)*sent))
+	}
 }
 
-func (cm *ConnectionManager) reportMetrics() {
-    cm.logger.Info("WebSocket metrics",
-        zap.Int64("active_connections", atomic.LoadInt64(&cm.metrics.ActiveConnections)),
-        zap.Int64("total_connections", atomic.LoadInt64(&cm.metrics.TotalConnections)),
-        zap.Int64("messages_received", atomic.LoadInt64(&cm.metrics.MessagesReceived)),
-        zap.Int64("messages_sent", atomic.LoadInt64(&cm.metrics.MessagesSent)),
-        zap.Int64("bytes_received", atomic.LoadInt64(&cm.metrics.BytesReceived)),
-        zap.Int64("bytes_sent", atomic.LoadInt64(&cm.metrics.BytesSent)),
-        zap.Int64("connection_errors", atomic.LoadInt64(&cm.metrics.ConnectionErrors)),
-        zap.Int64("message_errors", atomic.LoadInt64(&cm.metrics.MessageErrors)))
+// Client reader goroutine
+func (cm *ConnectionManager) clientReader(client *Client) {
+	defer func() {
+		cm.unregister <- client
+		cm.wg.Done()
+	}()
+	
+	client.Connection.SetReadLimit(client.maxMessageSize)
+	client.Connection.SetReadDeadline(time.Now().Add(client.pongWait))
+	
+	for {
+		_, message, err := client.Connection.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				cm.logger.Warn("WebSocket read error",
+					zap.String("client_id", client.ID),
+					zap.Error(err))
+			}
+			break
+		}
+		
+		client.LastActivity = time.Now()
+		atomic.AddInt64(&client.MessagesReceived, 1)
+		atomic.AddInt64(&client.BytesTransferred, int64(len(message)))
+		atomic.AddInt64(&cm.messagesReceived, 1)
+		
+		// Process message through router
+		if err := cm.messageRouter.ProcessMessage(client.ID, message); err != nil {
+			cm.logger.Error("Message processing error",
+				zap.String("client_id", client.ID),
+				zap.Error(err))
+		}
+	}
 }
 
-func (cm *ConnectionManager) cleanupStaleConnections() {
-    now := time.Now()
-    var staleConnections []string
-
-    cm.connections.Range(func(key, value interface{}) bool {
-        if conn, ok := value.(*Connection); ok {
-            if now.Sub(conn.LastActivity) > cm.config.IdleTimeout {
-                staleConnections = append(staleConnections, conn.ID)
-            }
-        }
-        return true
-    })
-
-    for _, connID := range staleConnections {
-        if conn, ok := cm.GetConnection(connID); ok {
-            cm.logger.Info("Closing stale connection",
-                zap.String("connection_id", connID),
-                zap.Duration("idle_time", now.Sub(conn.LastActivity)))
-            conn.Close()
-        }
-    }
+// Client writer goroutine
+func (cm *ConnectionManager) clientWriter(client *Client) {
+	ticker := time.NewTicker(cm.config.PingInterval)
+	defer func() {
+		ticker.Stop()
+		client.Connection.Close()
+		cm.wg.Done()
+	}()
+	
+	for {
+		select {
+		case message, ok := <-client.send:
+			client.Connection.SetWriteDeadline(time.Now().Add(client.writeWait))
+			if !ok {
+				client.Connection.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			
+			if err := client.Connection.WriteMessage(websocket.TextMessage, message); err != nil {
+				return
+			}
+			
+			atomic.AddInt64(&client.MessagesSent, 1)
+			atomic.AddInt64(&client.BytesTransferred, int64(len(message)))
+			
+		case <-ticker.C:
+			client.Connection.SetWriteDeadline(time.Now().Add(client.writeWait))
+			if err := client.Connection.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
 }
 
 // Helper functions
-func (cm *ConnectionManager) getClientIP(r *http.Request) string {
-    // Check X-Forwarded-For header first
-    if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-        return xff
-    }
-    // Check X-Real-IP header
-    if xri := r.Header.Get("X-Real-IP"); xri != "" {
-        return xri
-    }
-    // Fall back to remote address
-    return r.RemoteAddr
+func (cm *ConnectionManager) closeClient(client *Client) {
+	if atomic.CompareAndSwapInt32(&client.closed, 0, 1) {
+		close(client.send)
+		if client.pingTicker != nil {
+			client.pingTicker.Stop()
+		}
+	}
 }
 
-func (cm *ConnectionManager) getUserID(r *http.Request) string {
-    // Extract user ID from JWT token or session
-    // This would be implemented based on your authentication system
-    return "anonymous" // Placeholder
+func (cm *ConnectionManager) getChannelSubscriberCount(channel string) int {
+	if channelSubs, ok := cm.subscriptions.Load(channel); ok {
+		count := 0
+		channelSubs.(*sync.Map).Range(func(key, value interface{}) bool {
+			count++
+			return true
+		})
+		return count
+	}
+	return 0
 }
 
-func (cm *ConnectionManager) getSessionID(r *http.Request) string {
-    // Extract session ID from cookie or header
-    // This would be implemented based on your session management
-    return generateSessionID() // Placeholder
+func (cm *ConnectionManager) getSubscriptionCount() int {
+	total := 0
+	cm.subscriptions.Range(func(key, value interface{}) bool {
+		channelSubs := value.(*sync.Map)
+		channelSubs.Range(func(clientKey, clientValue interface{}) bool {
+			total++
+			return true
+		})
+		return true
+	})
+	return total
 }
 
-func generateConnectionID() string {
-    // Generate unique connection ID
-    return fmt.Sprintf("conn_%d_%d", time.Now().UnixNano(), rand.Int63())
-}
-
-func generateSessionID() string {
-    // Generate unique session ID
-    return fmt.Sprintf("sess_%d_%d", time.Now().UnixNano(), rand.Int63())
-}
-
-// Rate limiter implementation
-func NewRateLimiter(maxRequests int, window time.Duration) *RateLimiter {
-    return &RateLimiter{
-        maxRequests: maxRequests,
-        window:      window,
-        requests:    make([]time.Time, 0),
-    }
-}
-
-func (rl *RateLimiter) Allow() bool {
-    rl.mutex.Lock()
-    defer rl.mutex.Unlock()
-
-    now := time.Now()
-    cutoff := now.Add(-rl.window)
-
-    // Remove old requests
-    var validRequests []time.Time
-    for _, reqTime := range rl.requests {
-        if reqTime.After(cutoff) {
-            validRequests = append(validRequests, reqTime)
-        }
-    }
-    rl.requests = validRequests
-
-    // Check if we can allow this request
-    if len(rl.requests) < rl.maxRequests {
-        rl.requests = append(rl.requests, now)
-        return true
-    }
-
-    return false
-}
-
-func (cm *ConnectionManager) HandleAdminConnections(w http.ResponseWriter, r *http.Request) {
-    // Admin endpoint to view connection statistics
-    var connections []map[string]interface{}
-    
-    cm.connections.Range(func(key, value interface{}) bool {
-        if conn, ok := value.(*Connection); ok {
-            connections = append(connections, map[string]interface{}{
-                "id":              conn.ID,
-                "user_id":         conn.UserID,
-                "remote_addr":     conn.RemoteAddr,
-                "connected_at":    conn.ConnectedAt,
-                "last_activity":   conn.LastActivity,
-                "subscriptions":   len(conn.subscriptions),
-            })
-        }
-        return true
-    })
-
-    response := map[string]interface{}{
-        "total_connections": len(connections),
-        "connections":      connections,
-        "metrics":          cm.metrics,
-    }
-
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(response)
+func (cm *ConnectionManager) cleanup() {
+	now := time.Now()
+	
+	// Clean up stale connections
+	cm.connections.Range(func(key, value interface{}) bool {
+		client := value.(*Client)
+		if now.Sub(client.LastActivity) > 5*time.Minute {
+			cm.logger.Info("Removing stale connection",
+				zap.String("client_id", client.ID))
+			cm.unregister <- client
+		}
+		return true
+	})
+	
+	// Clean up empty channel subscriptions
+	cm.subscriptions.Range(func(key, value interface{}) bool {
+		channel := key.(string)
+		channelSubs := value.(*sync.Map)
+		
+		empty := true
+		channelSubs.Range(func(clientKey, clientValue interface{}) bool {
+			empty = false
+			return false // Break on first item
+		})
+		
+		if empty {
+			cm.subscriptions.Delete(channel)
+		}
+		return true
+	})
 }
