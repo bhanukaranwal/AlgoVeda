@@ -1,0 +1,492 @@
+# Complete CI/CD Pipeline for AlgoVeda Trading Platform
+# Based on GitHub Actions best practices for multi-language projects[8][12][16]
+
+name: AlgoVeda CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop, 'release/*', 'hotfix/*']
+    tags: ['v*']
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    - cron: '0 6 * * *' # Daily security scans
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: algoveda/platform
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Security permissions
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  id-token: write
+
+jobs:
+  # ====================
+  # CODE QUALITY & SECURITY
+  # ====================
+  
+  code-quality:
+    name: Code Quality Analysis
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    
+    - name: Cache Rust dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Format check (Rust)
+      run: |
+        cd core-engine
+        cargo fmt --all -- --check
+    
+    - name: Lint check (Rust)
+      run: |
+        cd core-engine
+        cargo clippy --all-targets --all-features -- -D warnings
+    
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+    
+    - name: Format check (Go)
+      run: |
+        cd websocket-gateway
+        gofmt -d . | tee gofmt-diff.txt
+        test ! -s gofmt-diff.txt
+    
+    - name: Lint check (Go)
+      run: |
+        cd websocket-gateway
+        go vet ./...
+        go install honnef.co/go/tools/cmd/staticcheck@latest
+        staticcheck ./...
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+    
+    - name: Install frontend dependencies
+      run: |
+        cd frontend
+        npm ci
+    
+    - name: Lint check (TypeScript)
+      run: |
+        cd frontend
+        npm run lint
+        npm run type-check
+
+  security-scan:
+    name: Security Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+    
+    - name: Rust security audit
+      run: |
+        cd core-engine
+        cargo install cargo-audit
+        cargo audit
+    
+    - name: Go security scan
+      run: |
+        cd websocket-gateway
+        go install golang.org/x/vuln/cmd/govulncheck@latest
+        govulncheck ./...
+    
+    - name: Node.js security audit
+      run: |
+        cd frontend
+        npm audit --audit-level=high
+
+  # ====================
+  # BUILD & TEST
+  # ====================
+  
+  test-rust:
+    name: Test Rust Components
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: timescale/timescaledb:latest-pg15
+        env:
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: algoveda_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target/
+        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libpq-dev pkg-config libssl-dev
+    
+    - name: Setup test database
+      run: |
+        PGPASSWORD=test_password psql -h localhost -U postgres -d algoveda_test -f database/migrations/complete_schema.sql
+      env:
+        PGPASSWORD: test_password
+    
+    - name: Run unit tests
+      run: |
+        cd core-engine
+        cargo test --verbose --all-features
+      env:
+        DATABASE_URL: postgresql://postgres:test_password@localhost/algoveda_test
+        REDIS_URL: redis://localhost:6379
+    
+    - name: Run integration tests
+      run: |
+        cd core-engine
+        cargo test --verbose --test integration_tests
+      env:
+        DATABASE_URL: postgresql://postgres:test_password@localhost/algoveda_test
+        REDIS_URL: redis://localhost:6379
+    
+    - name: Generate coverage report
+      run: |
+        cd core-engine
+        cargo install cargo-tarpaulin
+        cargo tarpaulin --out xml --output-dir coverage/
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        file: core-engine/coverage/cobertura.xml
+        flags: rust
+
+  test-go:
+    name: Test Go Components
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+    
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+    
+    - name: Download dependencies
+      run: |
+        cd websocket-gateway
+        go mod download
+    
+    - name: Run tests with coverage
+      run: |
+        cd websocket-gateway
+        go test -v -race -coverprofile=coverage.out ./...
+        go tool cover -html=coverage.out -o coverage.html
+    
+    - name: Upload coverage
+      uses: codecov/codecov-action@v4
+      with:
+        file: websocket-gateway/coverage.out
+        flags: go
+
+  test-frontend:
+    name: Test Frontend Components
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+    
+    - name: Install dependencies
+      run: |
+        cd frontend
+        npm ci
+    
+    - name: Run tests
+      run: |
+        cd frontend
+        npm run test:coverage
+    
+    - name: Upload coverage
+      uses: codecov/codecov-action@v4
+      with:
+        file: frontend/coverage/lcov.info
+        flags: frontend
+
+  # ====================
+  # BUILD DOCKER IMAGES
+  # ====================
+  
+  build-images:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [code-quality, test-rust, test-go, test-frontend]
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    
+    strategy:
+      matrix:
+        component: [core-engine, websocket-gateway, frontend]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.component }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix={{branch}}-
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: docker/${{ matrix.component }}.dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64,linux/arm64
+
+  # ====================
+  # PERFORMANCE TESTING
+  # ====================
+  
+  performance-test:
+    name: Performance & Load Testing
+    runs-on: ubuntu-latest
+    needs: [build-images]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup test environment
+      run: |
+        docker-compose -f docker-compose.test.yml up -d
+        sleep 30 # Wait for services to be ready
+    
+    - name: Run performance benchmarks
+      run: |
+        cd benchmarks
+        docker run --network host \
+          -v $(pwd):/workspace \
+          algoveda/performance-tester:latest \
+          --config /workspace/performance-config.yaml
+    
+    - name: Upload performance results
+      uses: actions/upload-artifact@v4
+      with:
+        name: performance-results
+        path: benchmarks/results/
+
+  # ====================
+  # DEPLOYMENT
+  # ====================
+  
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build-images, security-scan]
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure kubectl
+      uses: azure/k8s-set-context@v3
+      with:
+        method: kubeconfig
+        kubeconfig: ${{ secrets.KUBE_CONFIG_STAGING }}
+    
+    - name: Deploy to staging
+      run: |
+        kubectl apply -f k8s/staging/
+        kubectl set image deployment/algoveda-core \
+          core-engine=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-core-engine:${{ github.sha }} \
+          -n algoveda-staging
+        
+        kubectl rollout status deployment/algoveda-core -n algoveda-staging --timeout=600s
+    
+    - name: Run smoke tests
+      run: |
+        cd tests/smoke
+        npm ci
+        npm run test:staging
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-images, performance-test, security-scan]
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure kubectl
+      uses: azure/k8s-set-context@v3
+      with:
+        method: kubeconfig
+        kubeconfig: ${{ secrets.KUBE_CONFIG_PRODUCTION }}
+    
+    - name: Create deployment backup
+      run: |
+        kubectl get deployment algoveda-core -n algoveda-prod -o yaml > backup-deployment.yaml
+    
+    - name: Deploy to production
+      run: |
+        # Use the deployment script for zero-downtime deployment
+        chmod +x scripts/deploy-production.sh
+        ./scripts/deploy-production.sh ${{ github.ref_name }}
+    
+    - name: Verify deployment
+      run: |
+        kubectl rollout status deployment/algoveda-core -n algoveda-prod --timeout=900s
+        
+        # Health check
+        kubectl get pods -n algoveda-prod
+        kubectl logs -l app=algoveda-core -n algoveda-prod --tail=10
+    
+    - name: Run production smoke tests
+      run: |
+        cd tests/smoke
+        npm ci
+        npm run test:production
+    
+    - name: Notify deployment success
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        text: "🚀 AlgoVeda ${{ github.ref_name }} deployed successfully to production!"
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  # ====================
+  # CLEANUP
+  # ====================
+  
+  cleanup:
+    name: Cleanup Old Images
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs: [deploy-production]
+    
+    steps:
+    - name: Delete old container images
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const response = await github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg({
+            package_type: 'container',
+            package_name: 'algoveda/platform-core-engine',
+            org: context.repo.owner
+          });
+          
+          // Keep last 10 versions, delete older ones
+          const versionsToDelete = response.data.slice(10);
+          
+          for (const version of versionsToDelete) {
+            await github.rest.packages.deletePackageVersionForOrg({
+              package_type: 'container',
+              package_name: 'algoveda/platform-core-engine',
+              org: context.repo.owner,
+              package_version_id: version.id
+            });
+          }
