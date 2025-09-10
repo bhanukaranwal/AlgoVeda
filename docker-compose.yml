@@ -1,0 +1,228 @@
+version: '3.8'
+
+services:
+  # AlgoVeda Core Platform
+  algoveda-core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: algoveda-core
+    restart: unless-stopped
+    environment:
+      - ALGOVEDA_CONFIG_PATH=/app/configs/production.yaml
+      - DB_HOST=postgres
+      - DB_NAME=algoveda
+      - DB_USER=algoveda
+      - DB_PASSWORD=${DB_PASSWORD:-algoveda123}
+      - REDIS_HOST=redis
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-redis123}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-your-secret-key}
+      - DHAN_CLIENT_ID=${DHAN_CLIENT_ID}
+      - DHAN_ACCESS_TOKEN=${DHAN_ACCESS_TOKEN}
+      - DHAN_API_KEY=${DHAN_API_KEY}
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+      - "9090:9090"
+    volumes:
+      - algoveda-data:/data
+      - algoveda-logs:/logs
+      - ./configs:/app/configs:ro
+    depends_on:
+      - postgres
+      - redis
+      - jaeger
+    networks:
+      - algoveda-network
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 16G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: algoveda-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: algoveda
+      POSTGRES_USER: algoveda
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-algoveda123}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - algoveda-network
+    command: >
+      postgres
+        -c max_connections=200
+        -c shared_buffers=256MB
+        -c effective_cache_size=1GB
+        -c maintenance_work_mem=64MB
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=16MB
+        -c default_statistics_target=100
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: algoveda-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+      - ./configs/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks:
+      - algoveda-network
+    command: redis-server /usr/local/etc/redis/redis.conf
+    sysctls:
+      net.core.somaxconn: 1024
+
+  # Jaeger Tracing
+  jaeger:
+    image: jaegertracing/all-in-one:1.49
+    container_name: algoveda-jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+      - "6831:6831/udp"
+    environment:
+      COLLECTOR_OTLP_ENABLED: true
+    networks:
+      - algoveda-network
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: algoveda-prometheus
+    restart: unless-stopped
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - algoveda-network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+
+  # Grafana Dashboards
+  grafana:
+    image: grafana/grafana:10.1.2
+    container_name: algoveda-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin123}
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - algoveda-network
+    depends_on:
+      - prometheus
+
+  # Nginx Load Balancer
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: algoveda-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx-logs:/var/log/nginx
+    networks:
+      - algoveda-network
+    depends_on:
+      - algoveda-core
+
+  # ClickHouse for Analytics
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8-alpine
+    container_name: algoveda-clickhouse
+    restart: unless-stopped
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/config.xml:/etc/clickhouse-server/config.xml:ro
+    networks:
+      - algoveda-network
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  # Jupyter Lab for Analysis
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: algoveda-jupyter
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    environment:
+      JUPYTER_ENABLE_LAB: yes
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN:-algoveda123}
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - algoveda-data:/data:ro
+    networks:
+      - algoveda-network
+    command: start-notebook.sh --NotebookApp.token=${JUPYTER_TOKEN:-algoveda123}
+
+volumes:
+  algoveda-data:
+    driver: local
+  algoveda-logs:
+    driver: local
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+  clickhouse-data:
+    driver: local
+  nginx-logs:
+    driver: local
+
+networks:
+  algoveda-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
