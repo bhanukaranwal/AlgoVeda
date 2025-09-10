@@ -1,757 +1,296 @@
-/**
- * Main Trading Dashboard for AlgoVeda Platform
- * Features comprehensive real-time data visualization, portfolio monitoring,
- * risk management, and strategy performance analytics with WebGL acceleration.
+/*!
+ * Main Trading Dashboard - Central Hub for AlgoVeda
+ * Real-time trading interface with comprehensive market data
  */
 
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import {
-  Grid,
-  Paper,
-  Typography,
-  Box,
-  Tab,
-  Tabs,
-  Card,
-  CardContent,
-  Alert,
-  CircularProgress,
-  Fab,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  Switch,
-  FormControlLabel,
-  Tooltip,
-  IconButton,
-  Badge,
-} from '@mui/material';
-import {
-  Timeline,
-  TrendingUp,
-  TrendingDown,
-  AccountBalance,
-  Speed,
-  Security,
-  Assessment,
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { Grid, Box, Paper, Typography, Tabs, Tab, IconButton } from '@mui/material';
+import { 
+  Timeline, 
+  TrendingUp, 
+  Assessment, 
+  Security, 
   Settings,
-  Fullscreen,
-  Refresh,
-  NotificationsActive,
+  FullscreenIcon,
+  RefreshIcon 
 } from '@mui/icons-material';
-import { styled, useTheme } from '@mui/material/styles';
-import { Canvas } from '@react-three/fiber';
-import { OrbitControls, Stats } from '@react-three/drei';
+import { styled } from '@mui/material/styles';
 
-// Custom hooks and services
-import { useRealtimeData } from '../../hooks/useRealtimeData';
-import { usePerformanceAnalytics } from '../../hooks/usePerformanceAnalytics';
-import { useRiskAnalytics } from '../../hooks/useRiskAnalytics';
-import { useWebSocket } from '../../hooks/useWebSocket';
-import { chartRenderingService } from '../../services/chart-rendering-service';
+import { RealTimeMTMDashboard } from '../mtm_visualization/RealTimeMTMDashboard';
+import { OptionsAnalyticsDashboard } from '../options_analytics/OptionsAnalyticsDashboard';
+import { RiskDashboard } from '../risk_visualization/RiskDashboard';
+import { ComprehensiveBacktestDashboard } from '../backtesting_visualization/ComprehensiveBacktestDashboard';
+import { useRealtimeData } from '../../hooks/useRealtimeVisualization';
+import { useOrderManagement } from '../../hooks/useOrderManagement';
 
-// Chart components with WebGL acceleration
-import { EquityCurveChart } from '../charts/EquityCurveChart';
-import { PortfolioCompositionChart } from '../charts/PortfolioCompositionChart';
-import { RiskMetricsChart } from '../charts/RiskMetricsChart';
-import { VolatilitySurface3D } from '../options_analytics/VolatilitySurface3D';
-import { OrderBookHeatmap } from '../charts/OrderBookHeatmap';
-import { PerformanceMetricsTable } from '../tables/PerformanceMetricsTable';
-import { ActivePositionsTable } from '../tables/ActivePositionsTable';
-import { RecentTradesTable } from '../tables/RecentTradesTable';
-import { RiskMonitorPanel } from '../risk/RiskMonitorPanel';
-import { AlertsPanel } from '../alerts/AlertsPanel';
+const StyledPaper = styled(Paper)(({ theme }) => ({
+  padding: theme.spacing(3),
+  background: 'linear-gradient(145deg, #1e1e1e 0%, #2d2d2d 100%)',
+  border: '1px solid rgba(255, 255, 255, 0.1)',
+  borderRadius: 12,
+  minHeight: 400,
+}));
 
-// Types
-interface DashboardProps {
-  strategyId?: string;
-  portfolioId?: string;
-  customLayout?: LayoutConfig[];
-  theme?: 'light' | 'dark' | 'auto';
-}
-
-interface LayoutConfig {
-  id: string;
-  component: string;
-  props: Record<string, any>;
-  position: { x: number; y: number; w: number; h: number };
-}
-
-interface MarketDataPoint {
-  timestamp: number;
-  symbol: string;
-  price: number;
-  volume: number;
-  bid: number;
-  ask: number;
-  change: number;
-  changePercent: number;
-}
-
-interface PortfolioSummary {
-  totalEquity: number;
-  totalPnL: number;
-  dailyPnL: number;
-  positions: number;
-  cash: number;
-  margin: number;
-  buyingPower: number;
-  leverage: number;
-}
-
-interface RiskMetrics {
-  var95: number;
-  expectedShortfall: number;
-  maxDrawdown: number;
-  sharpeRatio: number;
-  volatility: number;
-  beta: number;
-  correlation: number;
-  concentration: number;
-}
-
-// Styled components
 const DashboardContainer = styled(Box)(({ theme }) => ({
-  height: '100vh',
-  width: '100vw',
-  display: 'flex',
-  flexDirection: 'column',
-  backgroundColor: theme.palette.background.default,
-  overflow: 'hidden',
-}));
-
-const HeaderBar = styled(Paper)(({ theme }) => ({
-  padding: theme.spacing(1, 2),
-  display: 'flex',
-  justifyContent: 'space-between',
-  alignItems: 'center',
-  backgroundColor: theme.palette.primary.main,
-  color: theme.palette.primary.contrastText,
-  minHeight: 64,
-}));
-
-const ContentArea = styled(Box)({
-  flex: 1,
-  display: 'flex',
-  overflow: 'hidden',
-});
-
-const LeftPanel = styled(Paper)(({ theme }) => ({
-  width: 300,
-  display: 'flex',
-  flexDirection: 'column',
-  borderRight: `1px solid ${theme.palette.divider}`,
-}));
-
-const MainContent = styled(Box)({
-  flex: 1,
-  display: 'flex',
-  flexDirection: 'column',
-  overflow: 'hidden',
-});
-
-const ChartContainer = styled(Paper)(({ theme }) => ({
-  margin: theme.spacing(1),
+  background: 'linear-gradient(135deg, #0a0a0a 0%, #1a1a1a 100%)',
+  minHeight: '100vh',
   padding: theme.spacing(2),
-  height: 'calc(100% - 16px)',
-  display: 'flex',
-  flexDirection: 'column',
+  color: '#ffffff',
 }));
 
-const MetricsCard = styled(Card)(({ theme }) => ({
-  margin: theme.spacing(1),
-  transition: 'all 0.3s ease-in-out',
-  '&:hover': {
-    transform: 'translateY(-2px)',
-    boxShadow: theme.shadows[8],
-  },
-}));
+interface TabPanelProps {
+  children?: React.ReactNode;
+  index: number;
+  value: number;
+}
 
-const PnLText = styled(Typography)<{ profit: boolean }>(({ theme, profit }) => ({
-  color: profit ? theme.palette.success.main : theme.palette.error.main,
-  fontWeight: 'bold',
-}));
+function TabPanel({ children, value, index, ...other }: TabPanelProps) {
+  return (
+    <div
+      role="tabpanel"
+      hidden={value !== index}
+      id={`dashboard-tabpanel-${index}`}
+      aria-labelledby={`dashboard-tab-${index}`}
+      {...other}
+    >
+      {value === index && <Box sx={{ p: 3 }}>{children}</Box>}
+    </div>
+  );
+}
 
-// Main Dashboard Component
-export const MainTradingDashboard: React.FC<DashboardProps> = ({
-  strategyId,
-  portfolioId,
-  customLayout,
-  theme = 'auto',
-}) => {
-  const muiTheme = useTheme();
-  const [selectedTab, setSelectedTab] = useState(0);
+export const MainTradingDashboard: React.FC = () => {
+  const [activeTab, setActiveTab] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
-  const [autoRefresh, setAutoRefresh] = useState(true);
-  const [refreshInterval, setRefreshInterval] = useState(1000); // 1 second
-  const [alertsCount, setAlertsCount] = useState(0);
-
-  // WebSocket connection for real-time data
+  const [refreshKey, setRefreshKey] = useState(0);
+  
+  // Custom hooks for real-time data
   const { 
+    marketData, 
+    portfolioData, 
     isConnected, 
-    subscribe, 
-    unsubscribe, 
-    sendMessage 
-  } = useWebSocket('ws://localhost:8080/ws');
+    connectionStatus 
+  } = useRealtimeData();
+  
+  const { 
+    orders, 
+    positions, 
+    submitOrder, 
+    cancelOrder 
+  } = useOrderManagement();
 
-  // Real-time data hooks
-  const {
-    marketData,
-    portfolioData,
-    isLoading: marketDataLoading,
-    error: marketDataError,
-  } = useRealtimeData({
-    symbols: ['SPY', 'AAPL', 'MSFT', 'GOOGL', 'TSLA'],
-    interval: refreshInterval,
-    enabled: autoRefresh,
-  });
+  // Tab change handler
+  const handleTabChange = useCallback((event: React.SyntheticEvent, newValue: number) => {
+    setActiveTab(newValue);
+  }, []);
 
-  const {
-    performanceMetrics,
-    equityCurve,
-    returns,
-    isLoading: performanceLoading,
-  } = usePerformanceAnalytics({
-    strategyId,
-    portfolioId,
-    timeframe: '1D',
-    refreshInterval,
-  });
+  // Refresh handler
+  const handleRefresh = useCallback(() => {
+    setRefreshKey(prev => prev + 1);
+  }, []);
 
-  const {
-    riskMetrics,
-    varData,
-    stressTestResults,
-    isLoading: riskLoading,
-  } = useRiskAnalytics({
-    portfolioId,
-    confidenceLevel: 0.95,
-    refreshInterval,
-  });
-
-  // Refs for chart performance optimization
-  const equityChartRef = useRef<HTMLCanvasElement>(null);
-  const portfolioChartRef = useRef<HTMLCanvasElement>(null);
-  const riskChartRef = useRef<HTMLCanvasElement>(null);
-
-  // Memoized portfolio summary
-  const portfolioSummary = useMemo((): PortfolioSummary => {
-    if (!portfolioData) {
-      return {
-        totalEquity: 0,
-        totalPnL: 0,
-        dailyPnL: 0,
-        positions: 0,
-        cash: 0,
-        margin: 0,
-        buyingPower: 0,
-        leverage: 0,
-      };
+  // Fullscreen toggle
+  const toggleFullscreen = useCallback(() => {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen();
+      setIsFullscreen(true);
+    } else {
+      document.exitFullscreen();
+      setIsFullscreen(false);
     }
+  }, []);
 
+  // Performance metrics calculation
+  const performanceMetrics = useMemo(() => {
+    if (!portfolioData) return null;
+    
+    const totalValue = portfolioData.positions?.reduce((sum, pos) => 
+      sum + (pos.quantity * pos.currentPrice), 0) || 0;
+    
+    const totalPnL = portfolioData.positions?.reduce((sum, pos) => 
+      sum + pos.unrealizedPnL, 0) || 0;
+    
+    const dayPnL = portfolioData.positions?.reduce((sum, pos) => 
+      sum + pos.dayPnL, 0) || 0;
+    
     return {
-      totalEquity: portfolioData.totalEquity || 0,
-      totalPnL: portfolioData.totalPnL || 0,
-      dailyPnL: portfolioData.dailyPnL || 0,
-      positions: portfolioData.positions?.length || 0,
-      cash: portfolioData.cash || 0,
-      margin: portfolioData.margin || 0,
-      buyingPower: portfolioData.buyingPower || 0,
-      leverage: portfolioData.leverage || 1,
+      totalValue,
+      totalPnL,
+      dayPnL,
+      pnlPercentage: totalValue > 0 ? (totalPnL / totalValue) * 100 : 0,
     };
   }, [portfolioData]);
 
-  // WebSocket subscriptions
-  useEffect(() => {
-    if (isConnected) {
-      // Subscribe to real-time market data
-      subscribe('market_data', (data: MarketDataPoint) => {
-        // Handle real-time market data updates
-        console.log('Market data update:', data);
-      });
-
-      // Subscribe to portfolio updates
-      subscribe('portfolio_updates', (data: any) => {
-        // Handle portfolio updates
-        console.log('Portfolio update:', data);
-      });
-
-      // Subscribe to risk alerts
-      subscribe('risk_alerts', (data: any) => {
-        setAlertsCount(prev => prev + 1);
-        console.log('Risk alert:', data);
-      });
-
-      // Subscribe to trade executions
-      subscribe('trade_executions', (data: any) => {
-        console.log('Trade execution:', data);
-      });
-
-      return () => {
-        unsubscribe('market_data');
-        unsubscribe('portfolio_updates');
-        unsubscribe('risk_alerts');
-        unsubscribe('trade_executions');
-      };
-    }
-  }, [isConnected, subscribe, unsubscribe]);
-
-  // Auto-refresh logic
-  useEffect(() => {
-    let interval: NodeJS.Timeout;
-    
-    if (autoRefresh) {
-      interval = setInterval(() => {
-        // Trigger data refresh
-        sendMessage({
-          type: 'refresh_request',
-          timestamp: Date.now(),
-        });
-      }, refreshInterval);
-    }
-
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [autoRefresh, refreshInterval, sendMessage]);
-
-  // Chart rendering optimization
-  useEffect(() => {
-    if (equityCurve && equityChartRef.current) {
-      chartRenderingService.renderEquityCurve(
-        equityChartRef.current,
-        equityCurve,
-        { 
-          animate: true,
-          showGrid: true,
-          showTooltips: true,
-        }
-      );
-    }
-  }, [equityCurve]);
-
-  const handleTabChange = useCallback((_: React.SyntheticEvent, newValue: number) => {
-    setSelectedTab(newValue);
-  }, []);
-
-  const handleFullscreenToggle = useCallback(() => {
-    setIsFullscreen(!isFullscreen);
-    if (!document.fullscreenElement) {
-      document.documentElement.requestFullscreen();
-    } else {
-      document.exitFullscreen();
-    }
-  }, [isFullscreen]);
-
-  const handleRefreshData = useCallback(() => {
-    sendMessage({
-      type: 'manual_refresh',
-      timestamp: Date.now(),
-    });
-  }, [sendMessage]);
-
-  const formatCurrency = useCallback((value: number): string => {
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: 'USD',
-      minimumFractionDigits: 2,
-    }).format(value);
-  }, []);
-
-  const formatPercentage = useCallback((value: number): string => {
-    return new Intl.NumberFormat('en-US', {
-      style: 'percent',
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    }).format(value / 100);
-  }, []);
-
-  // Loading state
-  if (marketDataLoading || performanceLoading || riskLoading) {
-    return (
-      <Box display="flex" justifyContent="center" alignItems="center" height="100vh">
-        <CircularProgress size={60} />
-        <Typography variant="h6" sx={{ ml: 2 }}>
-          Loading AlgoVeda Dashboard...
-        </Typography>
-      </Box>
-    );
-  }
-
-  // Error state
-  if (marketDataError) {
-    return (
-      <Box display="flex" justifyContent="center" alignItems="center" height="100vh">
-        <Alert severity="error" sx={{ maxWidth: 600 }}>
-          <Typography variant="h6">Dashboard Error</Typography>
-          <Typography>{marketDataError.message}</Typography>
-        </Alert>
-      </Box>
-    );
-  }
+  // Connection status indicator
+  const ConnectionStatus = () => (
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+      <Box
+        sx={{
+          width: 8,
+          height: 8,
+          borderRadius: '50%',
+          backgroundColor: isConnected ? '#4caf50' : '#f44336',
+        }}
+      />
+      <Typography variant="caption" color={isConnected ? 'success.main' : 'error.main'}>
+        {connectionStatus}
+      </Typography>
+    </Box>
+  );
 
   return (
     <DashboardContainer>
-      {/* Header Bar */}
-      <HeaderBar elevation={2}>
-        <Box display="flex" alignItems="center">
-          <Timeline sx={{ mr: 2 }} />
-          <Typography variant="h5" fontWeight="bold">
+      {/* Header */}
+      <Box sx={{ 
+        display: 'flex', 
+        justifyContent: 'space-between', 
+        alignItems: 'center', 
+        mb: 3,
+        p: 2,
+        background: 'rgba(255, 255, 255, 0.05)',
+        borderRadius: 2,
+        border: '1px solid rgba(255, 255, 255, 0.1)'
+      }}>
+        <Box>
+          <Typography variant="h4" component="h1" sx={{ 
+            fontWeight: 'bold',
+            background: 'linear-gradient(45deg, #ff6b6b, #4ecdc4)',
+            backgroundClip: 'text',
+            WebkitBackgroundClip: 'text',
+            color: 'transparent',
+          }}>
             AlgoVeda Trading Platform
           </Typography>
-          <Box
-            sx={{
-              ml: 2,
-              px: 1,
-              py: 0.5,
-              borderRadius: 1,
-              backgroundColor: isConnected ? 'success.main' : 'error.main',
-              color: 'white',
-            }}
-          >
-            <Typography variant="caption">
-              {isConnected ? 'CONNECTED' : 'DISCONNECTED'}
-            </Typography>
-          </Box>
-        </Box>
-
-        <Box display="flex" alignItems="center" gap={1}>
-          <Typography variant="h6">
-            {formatCurrency(portfolioSummary.totalEquity)}
+          <Typography variant="subtitle1" color="textSecondary">
+            Professional Algorithmic Trading Dashboard
           </Typography>
-          <PnLText profit={portfolioSummary.dailyPnL >= 0} variant="body1">
-            {portfolioSummary.dailyPnL >= 0 ? '+' : ''}
-            {formatCurrency(portfolioSummary.dailyPnL)}
-          </PnLText>
+        </Box>
+        
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+          <ConnectionStatus />
           
-          <Badge badgeContent={alertsCount} color="error">
-            <IconButton color="inherit">
-              <NotificationsActive />
+          {/* Performance Summary */}
+          {performanceMetrics && (
+            <Box sx={{ display: 'flex', gap: 3, alignItems: 'center' }}>
+              <Box sx={{ textAlign: 'center' }}>
+                <Typography variant="caption" color="textSecondary">Portfolio Value</Typography>
+                <Typography variant="h6" color="primary.main">
+                  ${performanceMetrics.totalValue.toLocaleString()}
+                </Typography>
+              </Box>
+              <Box sx={{ textAlign: 'center' }}>
+                <Typography variant="caption" color="textSecondary">Total P&L</Typography>
+                <Typography 
+                  variant="h6" 
+                  color={performanceMetrics.totalPnL >= 0 ? 'success.main' : 'error.main'}
+                >
+                  {performanceMetrics.totalPnL >= 0 ? '+' : ''}${performanceMetrics.totalPnL.toFixed(2)}
+                </Typography>
+              </Box>
+              <Box sx={{ textAlign: 'center' }}>
+                <Typography variant="caption" color="textSecondary">Day P&L</Typography>
+                <Typography 
+                  variant="h6" 
+                  color={performanceMetrics.dayPnL >= 0 ? 'success.main' : 'error.main'}
+                >
+                  {performanceMetrics.dayPnL >= 0 ? '+' : ''}${performanceMetrics.dayPnL.toFixed(2)}
+                </Typography>
+              </Box>
+            </Box>
+          )}
+          
+          {/* Action Buttons */}
+          <Box sx={{ display: 'flex', gap: 1 }}>
+            <IconButton onClick={handleRefresh} color="primary">
+              <RefreshIcon />
             </IconButton>
-          </Badge>
-
-          <Tooltip title="Refresh Data">
-            <IconButton color="inherit" onClick={handleRefreshData}>
-              <Refresh />
+            <IconButton onClick={toggleFullscreen} color="primary">
+              <FullscreenIcon />
             </IconButton>
-          </Tooltip>
-
-          <Tooltip title="Fullscreen">
-            <IconButton color="inherit" onClick={handleFullscreenToggle}>
-              <Fullscreen />
-            </IconButton>
-          </Tooltip>
-
-          <Tooltip title="Settings">
-            <IconButton color="inherit" onClick={() => setShowSettings(true)}>
+            <IconButton color="primary">
               <Settings />
             </IconButton>
-          </Tooltip>
+          </Box>
         </Box>
-      </HeaderBar>
+      </Box>
 
-      <ContentArea>
-        {/* Left Panel - Portfolio Summary and Controls */}
-        <LeftPanel elevation={1}>
-          <Box p={2}>
-            <Typography variant="h6" gutterBottom>
-              Portfolio Summary
-            </Typography>
-            
-            <Grid container spacing={2}>
-              <Grid item xs={12}>
-                <MetricsCard>
-                  <CardContent>
-                    <Box display="flex" alignItems="center" mb={1}>
-                      <AccountBalance color="primary" sx={{ mr: 1 }} />
-                      <Typography variant="subtitle2">Total Equity</Typography>
-                    </Box>
-                    <Typography variant="h5" fontWeight="bold">
-                      {formatCurrency(portfolioSummary.totalEquity)}
-                    </Typography>
-                  </CardContent>
-                </MetricsCard>
-              </Grid>
+      {/* Navigation Tabs */}
+      <Box sx={{ borderBottom: 1, borderColor: 'rgba(255, 255, 255, 0.1)', mb: 3 }}>
+        <Tabs 
+          value={activeTab} 
+          onChange={handleTabChange}
+          variant="scrollable"
+          scrollButtons="auto"
+          sx={{
+            '& .MuiTab-root': {
+              color: 'rgba(255, 255, 255, 0.7)',
+              '&.Mui-selected': {
+                color: '#4ecdc4',
+              },
+            },
+            '& .MuiTabs-indicator': {
+              backgroundColor: '#4ecdc4',
+            },
+          }}
+        >
+          <Tab 
+            icon={<Timeline />} 
+            label="Portfolio & P&L" 
+            id="dashboard-tab-0"
+            aria-controls="dashboard-tabpanel-0"
+          />
+          <Tab 
+            icon={<TrendingUp />} 
+            label="Options Analytics" 
+            id="dashboard-tab-1"
+            aria-controls="dashboard-tabpanel-1"
+          />
+          <Tab 
+            icon={<Security />} 
+            label="Risk Management" 
+            id="dashboard-tab-2"
+            aria-controls="dashboard-tabpanel-2"
+          />
+          <Tab 
+            icon={<Assessment />} 
+            label="Backtesting" 
+            id="dashboard-tab-3"
+            aria-controls="dashboard-tabpanel-3"
+          />
+        </Tabs>
+      </Box>
 
-              <Grid item xs={6}>
-                <MetricsCard>
-                  <CardContent>
-                    <Typography variant="caption" color="textSecondary">
-                      Daily P&L
-                    </Typography>
-                    <PnLText profit={portfolioSummary.dailyPnL >= 0} variant="h6">
-                      {formatCurrency(portfolioSummary.dailyPnL)}
-                    </PnLText>
-                  </CardContent>
-                </MetricsCard>
-              </Grid>
+      {/* Tab Content */}
+      <TabPanel value={activeTab} index={0}>
+        <RealTimeMTMDashboard 
+          key={`mtm-${refreshKey}`}
+          marketData={marketData}
+          portfolioData={portfolioData}
+          orders={orders}
+          positions={positions}
+        />
+      </TabPanel>
 
-              <Grid item xs={6}>
-                <MetricsCard>
-                  <CardContent>
-                    <Typography variant="caption" color="textSecondary">
-                      Total P&L
-                    </Typography>
-                    <PnLText profit={portfolioSummary.totalPnL >= 0} variant="h6">
-                      {formatCurrency(portfolioSummary.totalPnL)}
-                    </PnLText>
-                  </CardContent>
-                </MetricsCard>
-              </Grid>
+      <TabPanel value={activeTab} index={1}>
+        <OptionsAnalyticsDashboard 
+          key={`options-${refreshKey}`}
+          marketData={marketData}
+          portfolioData={portfolioData}
+        />
+      </TabPanel>
 
-              <Grid item xs={6}>
-                <MetricsCard>
-                  <CardContent>
-                    <Typography variant="caption" color="textSecondary">
-                      Positions
-                    </Typography>
-                    <Typography variant="h6" fontWeight="bold">
-                      {portfolioSummary.positions}
-                    </Typography>
-                  </CardContent>
-                </MetricsCard>
-              </Grid>
+      <TabPanel value={activeTab} index={2}>
+        <RiskDashboard 
+          key={`risk-${refreshKey}`}
+          portfolioData={portfolioData}
+          positions={positions}
+        />
+      </TabPanel>
 
-              <Grid item xs={6}>
-                <MetricsCard>
-                  <CardContent>
-                    <Typography variant="caption" color="textSecondary">
-                      Leverage
-                    </Typography>
-                    <Typography variant="h6" fontWeight="bold">
-                      {portfolioSummary.leverage.toFixed(2)}x
-                    </Typography>
-                  </CardContent>
-                </MetricsCard>
-              </Grid>
-            </Grid>
-          </Box>
-
-          {/* Risk Metrics Panel */}
-          <Box p={2} borderTop={1} borderColor="divider">
-            <Typography variant="h6" gutterBottom>
-              Risk Metrics
-            </Typography>
-            
-            {riskMetrics && (
-              <RiskMonitorPanel
-                metrics={riskMetrics}
-                compact={true}
-              />
-            )}
-          </Box>
-
-          {/* Alerts Panel */}
-          <Box flex={1} p={2} borderTop={1} borderColor="divider">
-            <AlertsPanel maxItems={5} />
-          </Box>
-        </LeftPanel>
-
-        {/* Main Content Area */}
-        <MainContent>
-          <Box borderBottom={1} borderColor="divider">
-            <Tabs value={selectedTab} onChange={handleTabChange}>
-              <Tab label="Overview" icon={<Assessment />} />
-              <Tab label="Charts" icon={<Timeline />} />
-              <Tab label="Options Analytics" icon={<Speed />} />
-              <Tab label="Risk Analysis" icon={<Security />} />
-            </Tabs>
-          </Box>
-
-          <Box flex={1} overflow="auto">
-            {selectedTab === 0 && (
-              <Grid container spacing={2} p={2}>
-                {/* Equity Curve Chart */}
-                <Grid item xs={12} md={8}>
-                  <ChartContainer>
-                    <Typography variant="h6" gutterBottom>
-                      Equity Curve
-                    </Typography>
-                    <Box flex={1}>
-                      <EquityCurveChart
-                        data={equityCurve}
-                        height={300}
-                        animated={true}
-                        showBenchmark={true}
-                      />
-                    </Box>
-                  </ChartContainer>
-                </Grid>
-
-                {/* Portfolio Composition */}
-                <Grid item xs={12} md={4}>
-                  <ChartContainer>
-                    <Typography variant="h6" gutterBottom>
-                      Portfolio Composition
-                    </Typography>
-                    <Box flex={1}>
-                      <PortfolioCompositionChart
-                        data={portfolioData?.positions || []}
-                        height={300}
-                      />
-                    </Box>
-                  </ChartContainer>
-                </Grid>
-
-                {/* Performance Metrics Table */}
-                <Grid item xs={12} md={6}>
-                  <ChartContainer>
-                    <Typography variant="h6" gutterBottom>
-                      Performance Metrics
-                    </Typography>
-                    <PerformanceMetricsTable
-                      metrics={performanceMetrics}
-                    />
-                  </ChartContainer>
-                </Grid>
-
-                {/* Active Positions */}
-                <Grid item xs={12} md={6}>
-                  <ChartContainer>
-                    <Typography variant="h6" gutterBottom>
-                      Active Positions
-                    </Typography>
-                    <ActivePositionsTable
-                      positions={portfolioData?.positions || []}
-                      maxRows={10}
-                    />
-                  </ChartContainer>
-                </Grid>
-
-                {/* Recent Trades */}
-                <Grid item xs={12}>
-                  <ChartContainer>
-                    <Typography variant="h6" gutterBottom>
-                      Recent Trades
-                    </Typography>
-                    <RecentTradesTable
-                      trades={portfolioData?.recentTrades || []}
-                      maxRows={20}
-                    />
-                  </ChartContainer>
-                </Grid>
-              </Grid>
-            )}
-
-            {selectedTab === 1 && (
-              <Grid container spacing={2} p={2}>
-                {/* Advanced Charts */}
-                <Grid item xs={12} md={6}>
-                  <ChartContainer>
-                    <Typography variant="h6" gutterBottom>
-                      Order Book Heatmap
-                    </Typography>
-                    <OrderBookHeatmap
-                      symbol="AAPL"
-                      height={400}
-                    />
-                  </ChartContainer>
-                </Grid>
-
-                <Grid item xs={12} md={6}>
-                  <ChartContainer>
-                    <Typography variant="h6" gutterBottom>
-                      Risk Metrics Over Time
-                    </Typography>
-                    <RiskMetricsChart
-                      data={varData}
-                      height={400}
-                    />
-                  </ChartContainer>
-                </Grid>
-              </Grid>
-            )}
-
-            {selectedTab === 2 && (
-              <Grid container spacing={2} p={2}>
-                {/* 3D Volatility Surface */}
-                <Grid item xs={12}>
-                  <ChartContainer>
-                    <Typography variant="h6" gutterBottom>
-                      3D Volatility Surface
-                    </Typography>
-                    <Box height={600}>
-                      <Canvas camera={{ position: [0, 0, 5] }}>
-                        <ambientLight intensity={0.5} />
-                        <pointLight position={[10, 10, 10]} />
-                        <VolatilitySurface3D
-                          symbol="AAPL"
-                          data={portfolioData?.optionsData}
-                        />
-                        <OrbitControls />
-                        <Stats />
-                      </Canvas>
-                    </Box>
-                  </ChartContainer>
-                </Grid>
-              </Grid>
-            )}
-
-            {selectedTab === 3 && (
-              <Grid container spacing={2} p={2}>
-                {/* Risk Analysis */}
-                <Grid item xs={12}>
-                  <ChartContainer>
-                    <Typography variant="h6" gutterBottom>
-                      Comprehensive Risk Analysis
-                    </Typography>
-                    <RiskMonitorPanel
-                      metrics={riskMetrics}
-                      stressTestResults={stressTestResults}
-                      compact={false}
-                    />
-                  </ChartContainer>
-                </Grid>
-              </Grid>
-            )}
-          </Box>
-        </MainContent>
-      </ContentArea>
-
-      {/* Settings Dialog */}
-      <Dialog open={showSettings} onClose={() => setShowSettings(false)} maxWidth="md" fullWidth>
-        <DialogTitle>Dashboard Settings</DialogTitle>
-        <DialogContent>
-          <Grid container spacing={3} p={2}>
-            <Grid item xs={12}>
-              <FormControlLabel
-                control={
-                  <Switch
-                    checked={autoRefresh}
-                    onChange={(e) => setAutoRefresh(e.target.checked)}
-                  />
-                }
-                label="Auto Refresh"
-              />
-            </Grid>
-            
-            <Grid item xs={12}>
-              <Typography gutterBottom>
-                Refresh Interval: {refreshInterval}ms
-              </Typography>
-              <input
-                type="range"
-                min="100"
-                max="5000"
-                step="100"
-                value={refreshInterval}
-                onChange={(e) => setRefreshInterval(parseInt(e.target.value))}
-                style={{ width: '100%' }}
-              />
-            </Grid>
-          </Grid>
-        </DialogContent>
-      </Dialog>
-
-      {/* Floating Action Button for Quick Actions */}
-      <Fab
-        color="primary"
-        sx={{ position: 'fixed', bottom: 16, right: 16 }}
-        onClick={() => setShowSettings(true)}
-      >
-        <Settings />
-      </Fab>
+      <TabPanel value={activeTab} index={3}>
+        <ComprehensiveBacktestDashboard 
+          key={`backtest-${refreshKey}`}
+        />
+      </TabPanel>
     </DashboardContainer>
   );
 };
