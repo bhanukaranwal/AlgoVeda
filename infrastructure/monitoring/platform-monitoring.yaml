@@ -1,0 +1,940 @@
+# AlgoVeda Platform Monitoring Stack
+# Comprehensive monitoring, alerting, and observability
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: algoveda-monitoring
+  labels:
+    name: monitoring
+---
+# Prometheus Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: algoveda-monitoring
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.45.0
+        ports:
+        - containerPort: 9090
+        args:
+        - '--config.file=/etc/prometheus/prometheus.yml'
+        - '--storage.tsdb.path=/prometheus/'
+        - '--web.console.libraries=/etc/prometheus/console_libraries'
+        - '--web.console.templates=/etc/prometheus/consoles'
+        - '--web.enable-lifecycle'
+        - '--storage.tsdb.retention.time=30d'
+        - '--storage.tsdb.retention.size=50GB'
+        volumeMounts:
+        - name: prometheus-config
+          mountPath: /etc/prometheus/
+        - name: prometheus-storage
+          mountPath: /prometheus/
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+      volumes:
+      - name: prometheus-config
+        configMap:
+          name: prometheus-config
+      - name: prometheus-storage
+        persistentVolumeClaim:
+          claimName: prometheus-storage
+---
+# Prometheus ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: algoveda-monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    
+    alerting:
+      alertmanagers:
+      - static_configs:
+        - targets:
+          - alertmanager:9093
+    
+    rule_files:
+    - "trading_rules.yml"
+    - "infrastructure_rules.yml"
+    - "security_rules.yml"
+    
+    scrape_configs:
+    - job_name: 'trading-engine'
+      static_configs:
+      - targets: ['trading-engine:9090']
+      metrics_path: /metrics
+      scrape_interval: 5s
+      
+    - job_name: 'market-data-gateway'
+      static_configs:
+      - targets: ['market-data-gateway:9090']
+      metrics_path: /metrics
+      scrape_interval: 5s
+      
+    - job_name: 'risk-management'
+      static_configs:
+      - targets: ['risk-management:9090']
+      metrics_path: /metrics
+      scrape_interval: 10s
+      
+    - job_name: 'execution-engine'
+      static_configs:
+      - targets: ['execution-engine:9090']
+      metrics_path: /metrics
+      scrape_interval: 5s
+      
+    - job_name: 'portfolio-service'
+      static_configs:
+      - targets: ['portfolio-service:9090']
+      metrics_path: /metrics
+      scrape_interval: 10s
+      
+    - job_name: 'kubernetes-pods'
+      kubernetes_sd_configs:
+      - role: pod
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+        
+    - job_name: 'node-exporter'
+      static_configs:
+      - targets: ['node-exporter:9100']
+      
+    - job_name: 'postgres-exporter'
+      static_configs:
+      - targets: ['postgres-exporter:9187']
+      
+    - job_name: 'redis-exporter'
+      static_configs:
+      - targets: ['redis-exporter:9121']
+
+  trading_rules.yml: |
+    groups:
+    - name: trading_alerts
+      rules:
+      - alert: HighOrderLatency
+        expr: trading_engine_order_latency_seconds > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          service: trading-engine
+        annotations:
+          summary: "High order processing latency detected"
+          description: "Order latency is {{ $value }}s for {{ $labels.instance }}"
+          
+      - alert: TradingEngineDown
+        expr: up{job="trading-engine"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: trading-engine
+        annotations:
+          summary: "Trading engine is down"
+          description: "Trading engine {{ $labels.instance }} is not responding"
+          
+      - alert: HighRejectRate
+        expr: rate(trading_engine_orders_rejected_total[5m]) > 0.1
+        for: 3m
+        labels:
+          severity: warning
+          service: trading-engine
+        annotations:
+          summary: "High order rejection rate"
+          description: "Order rejection rate is {{ $value }} for {{ $labels.instance }}"
+          
+      - alert: RiskLimitBreach
+        expr: risk_management_portfolio_var > 1000000
+        for: 1m
+        labels:
+          severity: critical
+          service: risk-management
+        annotations:
+          summary: "Portfolio VaR limit breached"
+          description: "Portfolio VaR is {{ $value }}, exceeding limit"
+          
+      - alert: MarketDataStale
+        expr: time() - market_data_last_update_timestamp > 300
+        for: 2m
+        labels:
+          severity: critical
+          service: market-data
+        annotations:
+          summary: "Market data is stale"
+          description: "Market data hasn't been updated for {{ $value }}s"
+          
+      - alert: PositionLimitBreach
+        expr: abs(portfolio_position_value) > 5000000
+        for: 1m
+        labels:
+          severity: warning
+          service: portfolio
+        annotations:
+          summary: "Position limit breach"
+          description: "Position {{ $labels.symbol }} exceeds limit: {{ $value }}"
+
+  infrastructure_rules.yml: |
+    groups:
+    - name: infrastructure_alerts
+      rules:
+      - alert: HighCPUUsage
+        expr: (100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)) > 80
+        for: 5m
+        labels:
+          severity: warning
+          component: infrastructure
+        annotations:
+          summary: "High CPU usage detected"
+          description: "CPU usage is {{ $value }}% on {{ $labels.instance }}"
+          
+      - alert: HighMemoryUsage
+        expr: ((node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+          component: infrastructure
+        annotations:
+          summary: "High memory usage detected"
+          description: "Memory usage is {{ $value }}% on {{ $labels.instance }}"
+          
+      - alert: DiskSpaceLow
+        expr: ((node_filesystem_size_bytes - node_filesystem_free_bytes) / node_filesystem_size_bytes) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+          component: infrastructure
+        annotations:
+          summary: "Low disk space"
+          description: "Disk usage is {{ $value }}% on {{ $labels.instance }}"
+          
+      - alert: PodCrashLooping
+        expr: rate(kube_pod_container_status_restarts_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: kubernetes
+        annotations:
+          summary: "Pod is crash looping"
+          description: "Pod {{ $labels.pod }} is crash looping in namespace {{ $labels.namespace }}"
+          
+      - alert: DatabaseConnectionHigh
+        expr: postgresql_stat_activity_count > 80
+        for: 3m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "High database connections"
+          description: "PostgreSQL has {{ $value }} active connections"
+
+  security_rules.yml: |
+    groups:
+    - name: security_alerts
+      rules:
+      - alert: HighFailedLoginRate
+        expr: rate(security_login_failures_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+          component: security
+        annotations:
+          summary: "High failed login rate detected"
+          description: "Failed login rate is {{ $value }} per second"
+          
+      - alert: SuspiciousActivity
+        expr: security_risk_score > 0.8
+        for: 1m
+        labels:
+          severity: critical
+          component: security
+        annotations:
+          summary: "Suspicious activity detected"
+          description: "High risk activity with score {{ $value }}"
+          
+      - alert: UnauthorizedAPIAccess
+        expr: rate(security_unauthorized_requests_total[5m]) > 5
+        for: 3m
+        labels:
+          severity: warning
+          component: security
+        annotations:
+          summary: "Unauthorized API access attempts"
+          description: "{{ $value }} unauthorized requests per second"
+
+---
+# Grafana Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: algoveda-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+      - name: grafana
+        image: grafana/grafana:10.0.0
+        ports:
+        - containerPort: 3000
+        env:
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: grafana-secret
+              key: admin-password
+        - name: GF_INSTALL_PLUGINS
+          value: "grafana-piechart-panel,grafana-worldmap-panel,yesoreyeram-boomtable-panel"
+        volumeMounts:
+        - name: grafana-storage
+          mountPath: /var/lib/grafana
+        - name: grafana-config
+          mountPath: /etc/grafana/provisioning
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+      volumes:
+      - name: grafana-storage
+        persistentVolumeClaim:
+          claimName: grafana-storage
+      - name: grafana-config
+        configMap:
+          name: grafana-config
+
+---
+# Grafana Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-config
+  namespace: algoveda-monitoring
+data:
+  datasources.yml: |
+    apiVersion: 1
+    datasources:
+    - name: Prometheus
+      type: prometheus
+      access: proxy
+      url: http://prometheus:9090
+      isDefault: true
+      editable: true
+    - name: Loki
+      type: loki
+      access: proxy
+      url: http://loki:3100
+      editable: true
+      
+  dashboards.yml: |
+    apiVersion: 1
+    providers:
+    - name: 'trading-dashboards'
+      orgId: 1
+      folder: 'AlgoVeda Trading'
+      type: file
+      disableDeletion: false
+      updateIntervalSeconds: 10
+      options:
+        path: /var/lib/grafana/dashboards/trading
+    - name: 'infrastructure-dashboards'
+      orgId: 1
+      folder: 'Infrastructure'
+      type: file
+      disableDeletion: false
+      updateIntervalSeconds: 10
+      options:
+        path: /var/lib/grafana/dashboards/infrastructure
+
+---
+# AlertManager Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: algoveda-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      containers:
+      - name: alertmanager
+        image: prom/alertmanager:v0.25.0
+        ports:
+        - containerPort: 9093
+        args:
+        - '--config.file=/etc/alertmanager/alertmanager.yml'
+        - '--storage.path=/alertmanager'
+        - '--web.external-url=http://alertmanager:9093'
+        volumeMounts:
+        - name: alertmanager-config
+          mountPath: /etc/alertmanager
+        - name: alertmanager-storage
+          mountPath: /alertmanager
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "200m"
+      volumes:
+      - name: alertmanager-config
+        configMap:
+          name: alertmanager-config
+      - name: alertmanager-storage
+        persistentVolumeClaim:
+          claimName: alertmanager-storage
+
+---
+# AlertManager Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: algoveda-monitoring
+data:
+  alertmanager.yml: |
+    global:
+      smtp_smarthost: 'smtp.gmail.com:587'
+      smtp_from: 'alerts@algoveda.com'
+      smtp_auth_username: 'alerts@algoveda.com'
+      smtp_auth_password: 'app_password'
+      
+    route:
+      group_by: ['alertname', 'cluster', 'service']
+      group_wait: 10s
+      group_interval: 30s
+      repeat_interval: 12h
+      receiver: 'trading-team'
+      routes:
+      - match:
+          severity: critical
+        receiver: 'critical-alerts'
+        group_wait: 5s
+        repeat_interval: 5m
+      - match:
+          component: security
+        receiver: 'security-team'
+        group_wait: 5s
+        repeat_interval: 1m
+      - match:
+          service: trading-engine
+        receiver: 'trading-team'
+        
+    receivers:
+    - name: 'trading-team'
+      email_configs:
+      - to: 'trading-team@algoveda.com'
+        subject: '[AlgoVeda] {{ .GroupLabels.alertname }}'
+        body: |
+          {{ range .Alerts }}
+          Alert: {{ .Annotations.summary }}
+          Description: {{ .Annotations.description }}
+          Labels: {{ range .Labels.SortedPairs }}{{ .Name }}={{ .Value }} {{ end }}
+          {{ end }}
+      slack_configs:
+      - api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+        channel: '#trading-alerts'
+        title: 'AlgoVeda Alert'
+        text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+        
+    - name: 'critical-alerts'
+      email_configs:
+      - to: 'cto@algoveda.com,trading-team@algoveda.com'
+        subject: '[CRITICAL] {{ .GroupLabels.alertname }}'
+        body: |
+          CRITICAL ALERT - IMMEDIATE ACTION REQUIRED
+          {{ range .Alerts }}
+          Alert: {{ .Annotations.summary }}
+          Description: {{ .Annotations.description }}
+          Time: {{ .StartsAt }}
+          {{ end }}
+      pagerduty_configs:
+      - routing_key: 'YOUR_PAGERDUTY_INTEGRATION_KEY'
+        description: 'Critical AlgoVeda Alert: {{ .GroupLabels.alertname }}'
+        
+    - name: 'security-team'
+      email_configs:
+      - to: 'security@algoveda.com,ciso@algoveda.com'
+        subject: '[SECURITY] {{ .GroupLabels.alertname }}'
+        body: |
+          SECURITY ALERT
+          {{ range .Alerts }}
+          Alert: {{ .Annotations.summary }}
+          Description: {{ .Annotations.description }}
+          Risk Level: {{ .Labels.severity }}
+          Time: {{ .StartsAt }}
+          {{ end }}
+
+---
+# Loki for Log Aggregation
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: algoveda-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loki
+  template:
+    metadata:
+      labels:
+        app: loki
+    spec:
+      containers:
+      - name: loki
+        image: grafana/loki:2.9.0
+        ports:
+        - containerPort: 3100
+        args:
+        - -config.file=/etc/loki/local-config.yaml
+        volumeMounts:
+        - name: loki-config
+          mountPath: /etc/loki
+        - name: loki-storage
+          mountPath: /loki
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+      volumes:
+      - name: loki-config
+        configMap:
+          name: loki-config
+      - name: loki-storage
+        persistentVolumeClaim:
+          claimName: loki-storage
+
+---
+# Loki Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  namespace: algoveda-monitoring
+data:
+  local-config.yaml: |
+    auth_enabled: false
+    
+    server:
+      http_listen_port: 3100
+      
+    ingester:
+      lifecycler:
+        address: 127.0.0.1
+        ring:
+          kvstore:
+            store: inmemory
+          replication_factor: 1
+        final_sleep: 0s
+      chunk_idle_period: 1h
+      max_chunk_age: 1h
+      chunk_target_size: 1048576
+      chunk_retain_period: 30s
+      
+    schema_config:
+      configs:
+        - from: 2020-10-24
+          store: boltdb-shipper
+          object_store: filesystem
+          schema: v11
+          index:
+            prefix: index_
+            period: 24h
+            
+    storage_config:
+      boltdb_shipper:
+        active_index_directory: /loki/boltdb-shipper-active
+        cache_location: /loki/boltdb-shipper-cache
+        shared_store: filesystem
+      filesystem:
+        directory: /loki/chunks
+        
+    limits_config:
+      enforce_metric_name: false
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h
+      
+    chunk_store_config:
+      max_look_back_period: 0s
+      
+    table_manager:
+      retention_deletes_enabled: true
+      retention_period: 336h
+
+---
+# Jaeger for Distributed Tracing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: algoveda-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+      - name: jaeger
+        image: jaegertracing/all-in-one:1.47
+        ports:
+        - containerPort: 16686
+        - containerPort: 14268
+        env:
+        - name: COLLECTOR_ZIPKIN_HOST_PORT
+          value: ":9411"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+
+---
+# Node Exporter DaemonSet
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: algoveda-monitoring
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: node-exporter
+        image: prom/node-exporter:v1.6.0
+        args:
+        - '--path.procfs=/host/proc'
+        - '--path.sysfs=/host/sys'
+        - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+        ports:
+        - containerPort: 9100
+          hostPort: 9100
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+      volumes:
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+      tolerations:
+      - operator: Exists
+
+---
+# Redis Exporter
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-exporter
+  namespace: algoveda-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-exporter
+  template:
+    metadata:
+      labels:
+        app: redis-exporter
+    spec:
+      containers:
+      - name: redis-exporter
+        image: oliver006/redis_exporter:v1.52.0
+        ports:
+        - containerPort: 9121
+        env:
+        - name: REDIS_ADDR
+          value: "redis://redis:6379"
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+
+---
+# PostgreSQL Exporter
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-exporter
+  namespace: algoveda-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-exporter
+  template:
+    metadata:
+      labels:
+        app: postgres-exporter
+    spec:
+      containers:
+      - name: postgres-exporter
+        image: prometheuscommunity/postgres-exporter:v0.13.2
+        ports:
+        - containerPort: 9187
+        env:
+        - name: DATA_SOURCE_NAME
+          value: "postgresql://postgres:password@postgres:5432/algoveda_trading?sslmode=disable"
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: algoveda-monitoring
+spec:
+  ports:
+  - port: 9090
+    targetPort: 9090
+  selector:
+    app: prometheus
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: algoveda-monitoring
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 3000
+    targetPort: 3000
+  selector:
+    app: grafana
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: algoveda-monitoring
+spec:
+  ports:
+  - port: 9093
+    targetPort: 9093
+  selector:
+    app: alertmanager
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: algoveda-monitoring
+spec:
+  ports:
+  - port: 3100
+    targetPort: 3100
+  selector:
+    app: loki
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: algoveda-monitoring
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 16686
+    targetPort: 16686
+    name: ui
+  - port: 14268
+    targetPort: 14268
+    name: collector
+  selector:
+    app: jaeger
+
+---
+# Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-storage
+  namespace: algoveda-monitoring
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-storage
+  namespace: algoveda-monitoring
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: alertmanager-storage
+  namespace: algoveda-monitoring
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: loki-storage
+  namespace: algoveda-monitoring
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+# Secrets
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-secret
+  namespace: algoveda-monitoring
+type: Opaque
+stringData:
+  admin-password: "secure_grafana_password_2025"
+
+---
+# ServiceAccount and RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: algoveda-monitoring
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "endpoints", "nodes", "nodes/proxy"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["extensions", "apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: algoveda-monitoring
