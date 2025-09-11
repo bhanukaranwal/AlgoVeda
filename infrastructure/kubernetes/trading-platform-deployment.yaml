@@ -1,0 +1,1112 @@
+# AlgoVeda Trading Platform - Complete Kubernetes Deployment
+# Cloud-native deployment with auto-scaling, monitoring, and high availability
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: algoveda-trading
+  labels:
+    environment: production
+    platform: algoveda
+---
+# ConfigMap for Application Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: algoveda-config
+  namespace: algoveda-trading
+data:
+  # Core Trading Engine Configuration
+  RUST_LOG: "info"
+  DATABASE_URL: "postgresql://algoveda:secure_password@postgres:5432/algoveda_trading"
+  REDIS_URL: "redis://redis:6379"
+  KAFKA_BROKERS: "kafka-0.kafka:9092,kafka-1.kafka:9092,kafka-2.kafka:9092"
+  
+  # Market Data Configuration
+  MARKET_DATA_FEED_URL: "wss://market-data-gateway:8080/ws"
+  ENABLE_REAL_TIME_DATA: "true"
+  MARKET_DATA_BUFFER_SIZE: "10000"
+  
+  # Trading Configuration
+  ENABLE_PAPER_TRADING: "false"
+  MAX_ORDERS_PER_SECOND: "1000"
+  POSITION_LIMITS_ENABLED: "true"
+  RISK_CHECKS_ENABLED: "true"
+  
+  # Prime Brokerage Configuration
+  ENABLE_PRIME_BROKERAGE: "true"
+  MAX_PRIME_BROKERS: "5"
+  CROSS_MARGIN_ENABLED: "true"
+  
+  # Cryptocurrency Configuration
+  ENABLE_CRYPTO_TRADING: "true"
+  ENABLE_DEFI_INTEGRATION: "true"
+  GAS_OPTIMIZATION: "true"
+  
+  # Monitoring Configuration
+  PROMETHEUS_ENDPOINT: "http://prometheus:9090"
+  JAEGER_ENDPOINT: "http://jaeger:14268"
+  
+  # Security Configuration
+  JWT_SECRET_KEY: "secure_jwt_secret_key_production"
+  ENCRYPTION_KEY: "AES256_encryption_key_production"
+  ENABLE_2FA: "true"
+  
+  # Performance Configuration
+  THREAD_POOL_SIZE: "16"
+  CONNECTION_POOL_SIZE: "100"
+  CACHE_TTL_SECONDS: "300"
+
+---
+# Secret for Sensitive Configuration
+apiVersion: v1
+kind: Secret
+metadata:
+  name: algoveda-secrets
+  namespace: algoveda-trading
+type: Opaque
+stringData:
+  # Database Credentials
+  DB_PASSWORD: "ultra_secure_database_password_2025"
+  DB_USER: "algoveda_user"
+  
+  # API Keys
+  BLOOMBERG_API_KEY: "bloomberg_api_key_production"
+  REUTERS_API_KEY: "reuters_api_key_production"
+  BINANCE_API_KEY: "binance_api_key_production"
+  COINBASE_API_KEY: "coinbase_api_key_production"
+  
+  # Prime Broker Credentials
+  GOLDMAN_SACHS_API_KEY: "goldman_sachs_api_key"
+  MORGAN_STANLEY_API_KEY: "morgan_stanley_api_key"
+  JP_MORGAN_API_KEY: "jp_morgan_api_key"
+  
+  # Blockchain RPC URLs
+  ETHEREUM_RPC_URL: "https://mainnet.infura.io/v3/your_infura_key"
+  POLYGON_RPC_URL: "https://polygon-mainnet.infura.io/v3/your_infura_key"
+  
+  # JWT Secret
+  JWT_SECRET: "super_secure_jwt_secret_for_production_use_only"
+  
+  # TLS Certificates
+  TLS_CERT: |
+    -----BEGIN CERTIFICATE-----
+    [Your TLS Certificate Here]
+    -----END CERTIFICATE-----
+  TLS_KEY: |
+    -----BEGIN PRIVATE KEY-----
+    [Your TLS Private Key Here]
+    -----END PRIVATE KEY-----
+
+---
+# PostgreSQL Database Deployment
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: algoveda-trading
+spec:
+  serviceName: postgres
+  replicas: 3
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_DB
+          value: "algoveda_trading"
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: algoveda-secrets
+              key: DB_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: algoveda-secrets
+              key: DB_PASSWORD
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - $(POSTGRES_USER)
+          initialDelaySeconds: 30
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - $(POSTGRES_USER)
+          initialDelaySeconds: 5
+          timeoutSeconds: 1
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-storage
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 100Gi
+
+---
+# Redis Cache Deployment
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: algoveda-trading
+spec:
+  serviceName: redis
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        command:
+        - redis-server
+        - --appendonly yes
+        - --save 900 1
+        - --save 300 10
+        - --save 60 10000
+        - --maxmemory 2gb
+        - --maxmemory-policy allkeys-lru
+        ports:
+        - containerPort: 6379
+        volumeMounts:
+        - name: redis-storage
+          mountPath: /data
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          tcpSocket:
+            port: 6379
+          initialDelaySeconds: 30
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          timeoutSeconds: 1
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-storage
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 20Gi
+
+---
+# Kafka Cluster for Event Streaming
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: algoveda-trading
+spec:
+  serviceName: kafka
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+      - name: kafka
+        image: confluentinc/cp-kafka:7.4.0
+        env:
+        - name: KAFKA_BROKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: KAFKA_ZOOKEEPER_CONNECT
+          value: "zookeeper:2181"
+        - name: KAFKA_ADVERTISED_LISTENERS
+          value: "PLAINTEXT://$(hostname).kafka:9092"
+        - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+          value: "3"
+        - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+          value: "3"
+        - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+          value: "2"
+        - name: KAFKA_LOG_RETENTION_HOURS
+          value: "168"
+        - name: KAFKA_LOG_SEGMENT_BYTES
+          value: "1073741824"
+        - name: KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS
+          value: "300000"
+        - name: KAFKA_NUM_PARTITIONS
+          value: "12"
+        - name: KAFKA_DEFAULT_REPLICATION_FACTOR
+          value: "3"
+        ports:
+        - containerPort: 9092
+        volumeMounts:
+        - name: kafka-storage
+          mountPath: /var/lib/kafka/data
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        livenessProbe:
+          tcpSocket:
+            port: 9092
+          initialDelaySeconds: 60
+          timeoutSeconds: 10
+        readinessProbe:
+          tcpSocket:
+            port: 9092
+          initialDelaySeconds: 20
+          timeoutSeconds: 10
+  volumeClaimTemplates:
+  - metadata:
+      name: kafka-storage
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 50Gi
+
+---
+# Core Trading Engine Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trading-engine
+  namespace: algoveda-trading
+  labels:
+    app: trading-engine
+    tier: core
+spec:
+  replicas: 6
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: trading-engine
+  template:
+    metadata:
+      labels:
+        app: trading-engine
+        tier: core
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - trading-engine
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: trading-engine
+        image: algoveda/trading-engine:v2.1.0
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: metrics
+        - containerPort: 8081
+          name: grpc
+        envFrom:
+        - configMapRef:
+            name: algoveda-config
+        - secretRef:
+            name: algoveda-secrets
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2000m"
+          limits:
+            memory: "8Gi"
+            cpu: "4000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        startupProbe:
+          httpGet:
+            path: /startup
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 1
+          failureThreshold: 30
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: cache
+          mountPath: /app/cache
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: cache
+        emptyDir: {}
+      terminationGracePeriodSeconds: 30
+
+---
+# Market Data Gateway Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: market-data-gateway
+  namespace: algoveda-trading
+  labels:
+    app: market-data-gateway
+    tier: data
+spec:
+  replicas: 4
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: market-data-gateway
+  template:
+    metadata:
+      labels:
+        app: market-data-gateway
+        tier: data
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      containers:
+      - name: market-data-gateway
+        image: algoveda/market-data-gateway:v2.1.0
+        ports:
+        - containerPort: 8080
+          name: websocket
+        - containerPort: 9090
+          name: metrics
+        envFrom:
+        - configMapRef:
+            name: algoveda-config
+        - secretRef:
+            name: algoveda-secrets
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+
+---
+# Risk Management Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: risk-management
+  namespace: algoveda-trading
+  labels:
+    app: risk-management
+    tier: core
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: risk-management
+  template:
+    metadata:
+      labels:
+        app: risk-management
+        tier: core
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      containers:
+      - name: risk-management
+        image: algoveda/risk-management:v2.1.0
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: metrics
+        envFrom:
+        - configMapRef:
+            name: algoveda-config
+        - secretRef:
+            name: algoveda-secrets
+        resources:
+          requests:
+            memory: "3Gi"
+            cpu: "1500m"
+          limits:
+            memory: "6Gi"
+            cpu: "3000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+
+---
+# Client Portal Web Application
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client-portal
+  namespace: algoveda-trading
+  labels:
+    app: client-portal
+    tier: frontend
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: client-portal
+  template:
+    metadata:
+      labels:
+        app: client-portal
+        tier: frontend
+    spec:
+      containers:
+      - name: client-portal
+        image: algoveda/client-portal:v2.1.0
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: REACT_APP_API_URL
+          value: "https://api.algoveda.com"
+        - name: REACT_APP_WS_URL
+          value: "wss://ws.algoveda.com"
+        - name: NODE_ENV
+          value: "production"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+# API Gateway with NGINX
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: algoveda-trading
+  labels:
+    app: api-gateway
+    tier: gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+        tier: gateway
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25-alpine
+        ports:
+        - containerPort: 80
+          name: http
+        - containerPort: 443
+          name: https
+        volumeMounts:
+        - name: nginx-config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+        - name: tls-certs
+          mountPath: /etc/ssl/certs
+          readOnly: true
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: nginx-config
+        configMap:
+          name: nginx-config
+      - name: tls-certs
+        secret:
+          secretName: algoveda-secrets
+          items:
+          - key: TLS_CERT
+            path: tls.crt
+          - key: TLS_KEY
+            path: tls.key
+
+---
+# Horizontal Pod Autoscaler for Trading Engine
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: trading-engine-hpa
+  namespace: algoveda-trading
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: trading-engine
+  minReplicas: 6
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+
+---
+# HPA for Market Data Gateway
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: market-data-gateway-hpa
+  namespace: algoveda-trading
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: market-data-gateway
+  minReplicas: 4
+  maxReplicas: 12
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 70
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: trading-engine
+  namespace: algoveda-trading
+  labels:
+    app: trading-engine
+spec:
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+  - port: 8081
+    targetPort: 8081
+    name: grpc
+  - port: 9090
+    targetPort: 9090
+    name: metrics
+  selector:
+    app: trading-engine
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: market-data-gateway
+  namespace: algoveda-trading
+  labels:
+    app: market-data-gateway
+spec:
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: websocket
+  - port: 9090
+    targetPort: 9090
+    name: metrics
+  selector:
+    app: market-data-gateway
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: algoveda-trading
+spec:
+  ports:
+  - port: 5432
+    targetPort: 5432
+  selector:
+    app: postgres
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: algoveda-trading
+spec:
+  ports:
+  - port: 6379
+    targetPort: 6379
+  selector:
+    app: redis
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: algoveda-trading
+spec:
+  ports:
+  - port: 9092
+    targetPort: 9092
+  selector:
+    app: kafka
+  type: ClusterIP
+  clusterIP: None
+
+---
+# Load Balancer Service for External Access
+apiVersion: v1
+kind: Service
+metadata:
+  name: algoveda-loadbalancer
+  namespace: algoveda-trading
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-ssl-cert: "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+    service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "https"
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 80
+    name: http
+  - port: 443
+    targetPort: 443
+    name: https
+  selector:
+    app: api-gateway
+
+---
+# Network Policies for Security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: trading-engine-netpol
+  namespace: algoveda-trading
+spec:
+  podSelector:
+    matchLabels:
+      app: trading-engine
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: api-gateway
+    - podSelector:
+        matchLabels:
+          app: client-portal
+    ports:
+    - protocol: TCP
+      port: 8080
+    - protocol: TCP
+      port: 8081
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+    ports:
+    - protocol: TCP
+      port: 6379
+  - to:
+    - podSelector:
+        matchLabels:
+          app: kafka
+    ports:
+    - protocol: TCP
+      port: 9092
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 443
+
+---
+# Pod Disruption Budget for High Availability
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: trading-engine-pdb
+  namespace: algoveda-trading
+spec:
+  minAvailable: 4
+  selector:
+    matchLabels:
+      app: trading-engine
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: market-data-gateway-pdb
+  namespace: algoveda-trading
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: market-data-gateway
+
+---
+# NGINX Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: algoveda-trading
+data:
+  nginx.conf: |
+    events {
+        worker_connections 1024;
+    }
+    
+    http {
+        upstream trading_engine {
+            least_conn;
+            server trading-engine:8080;
+        }
+        
+        upstream market_data_gateway {
+            least_conn;
+            server market-data-gateway:8080;
+        }
+        
+        upstream client_portal {
+            least_conn;
+            server client-portal:3000;
+        }
+        
+        # Rate limiting
+        limit_req_zone $binary_remote_addr zone=api:10m rate=100r/s;
+        limit_req_zone $binary_remote_addr zone=ws:10m rate=50r/s;
+        
+        # Security headers
+        add_header X-Frame-Options DENY;
+        add_header X-Content-Type-Options nosniff;
+        add_header X-XSS-Protection "1; mode=block";
+        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload";
+        
+        # API Gateway
+        server {
+            listen 80;
+            server_name api.algoveda.com;
+            
+            location /health {
+                return 200 "healthy\n";
+                add_header Content-Type text/plain;
+            }
+            
+            location /api/v1/ {
+                limit_req zone=api burst=20 nodelay;
+                proxy_pass http://trading_engine/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+            }
+            
+            location /ws {
+                limit_req zone=ws burst=10 nodelay;
+                proxy_pass http://market_data_gateway;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection "upgrade";
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+            }
+            
+            location / {
+                proxy_pass http://client_portal;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+            }
+        }
+        
+        # HTTPS Server
+        server {
+            listen 443 ssl http2;
+            server_name api.algoveda.com;
+            
+            ssl_certificate /etc/ssl/certs/tls.crt;
+            ssl_certificate_key /etc/ssl/certs/tls.key;
+            ssl_protocols TLSv1.2 TLSv1.3;
+            ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
+            ssl_prefer_server_ciphers off;
+            
+            location /health {
+                return 200 "healthy\n";
+                add_header Content-Type text/plain;
+            }
+            
+            location /api/v1/ {
+                limit_req zone=api burst=20 nodelay;
+                proxy_pass http://trading_engine/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+            }
+            
+            location /ws {
+                limit_req zone=ws burst=10 nodelay;
+                proxy_pass http://market_data_gateway;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection "upgrade";
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+            }
+            
+            location / {
+                proxy_pass http://client_portal;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+            }
+        }
+    }
+
+---
+# Monitoring with Prometheus ServiceMonitor
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: algoveda-metrics
+  namespace: algoveda-trading
+  labels:
+    app: algoveda
+spec:
+  selector:
+    matchLabels:
+      app: trading-engine
+  endpoints:
+  - port: metrics
+    interval: 15s
+    path: /metrics
+
+---
+# RBAC Configuration
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: algoveda-service-account
+  namespace: algoveda-trading
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: algoveda-cluster-role
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "endpoints"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: algoveda-cluster-role-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: algoveda-cluster-role
+subjects:
+- kind: ServiceAccount
+  name: algoveda-service-account
+  namespace: algoveda-trading
